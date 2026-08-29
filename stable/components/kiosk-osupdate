@@ -1,0 +1,249 @@
+#!/bin/bash
+# A/B operating-system updates.
+#
+#   kiosk-osupdate status              which slot runs, which is committed
+#   kiosk-osupdate check               is a newer OS published?
+#   kiosk-osupdate apply [--reboot]    write the inactive slot and arm it
+#   kiosk-osupdate commit              keep the slot we booted into
+#
+# The running slot is never touched. A new system is unpacked into the *other*
+# slot, and the boot arbiter on the ESP is asked to try it once. If it comes up
+# and the client is healthy, `commit` makes that slot the committed one. If it
+# does not, nobody has to do anything: the one-shot was consumed at boot, so the
+# next boot returns to the committed slot on its own. That property is what
+# makes this safe to run on a machine nobody can drive to, and it is verified
+# in QEMU rather than assumed.
+#
+# Trust is the same chain as component updates: a signed manifest, verified
+# against the key shipped in the image, then a sha256 over the payload. TLS
+# authenticates the CDN, not us.
+set -uo pipefail
+
+CFG=/etc/kiosk/update.json
+SIGNERS=/etc/kiosk/update-signers
+NS=steadyscreen-release
+PRINCIPAL=releases@steadyscreen.com
+ESP_GRUB=/boot/efi/boot/grub
+GRUBENV="$ESP_GRUB/grubenv"
+STATE=/var/lib/kiosk/osupdate.json
+
+die() { echo "$*" >&2; exit 1; }
+note() { printf '    %s\n' "$*"; }
+
+cfg() {
+    python3 -c "
+import json
+try: c=json.load(open('$CFG'))
+except Exception: c={}
+print(c.get('$1', '''$2'''))
+" 2>/dev/null || echo "$2"
+}
+
+# --- slots ----------------------------------------------------------------
+
+running_slot() {
+    local src label
+    src=$(findmnt -no SOURCE / 2>/dev/null) || return 1
+    label=$(blkid -s LABEL -o value "$src" 2>/dev/null)
+    case "$label" in
+        ds-root-a) echo a ;;
+        ds-root-b) echo b ;;
+        *) return 1 ;;
+    esac
+}
+
+other_slot() { [ "$1" = a ] && echo b || echo a; }
+
+slot_dev() {
+    # By label, because that is the only name that stays true when a slot is
+    # reimaged. blkid needs a nudge after a mkfs, hence the -c /dev/null.
+    blkid -c /dev/null -L "ds-root-$1" 2>/dev/null
+}
+
+committed_slot() {
+    grub-editenv "$GRUBENV" list 2>/dev/null | sed -n 's/^ds_slot=//p' | head -1
+}
+
+pending_try() {
+    grub-editenv "$GRUBENV" list 2>/dev/null | sed -n 's/^ds_try=//p' | head -1
+}
+
+# --- the published OS -----------------------------------------------------
+
+fetch_os_manifest() {
+    local base tmp bust
+    base=$(cfg base_url "")
+    [ -n "$base" ] || die "no base_url in $CFG"
+    tmp="$1"
+    bust=$(date +%s)
+    curl -fsS --max-time 30 -H "Cache-Control: no-cache" \
+         -o "$tmp/os.json"     "$base/os/manifest.json?t=$bust" \
+        || die "no OS manifest published at $base/os/"
+    curl -fsS --max-time 30 -H "Cache-Control: no-cache" \
+         -o "$tmp/os.json.sig" "$base/os/manifest.json.sig?t=$bust" \
+        || die "cannot fetch the OS manifest signature"
+    [ -f "$SIGNERS" ] || die "no trust anchor at $SIGNERS -- refusing"
+    ssh-keygen -Y verify -f "$SIGNERS" -I "$PRINCIPAL" -n "$NS" \
+        -s "$tmp/os.json.sig" < "$tmp/os.json" >/dev/null 2>&1 \
+        || die "OS manifest signature is NOT valid -- refusing"
+}
+
+manifest_field() {
+    python3 -c "
+import json,sys
+print(json.load(open(sys.argv[1])).get(sys.argv[2],''))" "$1" "$2" 2>/dev/null
+}
+
+installed_os() { cat /etc/kiosk/os-version 2>/dev/null || echo "unknown"; }
+
+# --- actions --------------------------------------------------------------
+
+cmd_status() {
+    local run com try
+    run=$(running_slot) || die "this system does not boot from a labelled slot;
+       it predates A/B and cannot take an OS update. Reinstall from a current
+       image."
+    com=$(committed_slot); try=$(pending_try)
+    echo "running   : slot $run  ($(slot_dev "$run"))"
+    echo "committed : slot ${com:-<unset>}"
+    echo "pending   : ${try:-none}"
+    echo "installed : $(installed_os)"
+    [ "$run" != "${com:-}" ] && [ -n "${com:-}" ] && \
+        echo "NOTE      : running an uncommitted slot; a reboot would return to $com"
+    return 0
+}
+
+cmd_check() {
+    local tmp ver have
+    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+    fetch_os_manifest "$tmp"
+    ver=$(manifest_field "$tmp/os.json" version)
+    have=$(installed_os)
+    python3 -c "
+import json
+print(json.dumps({'available': '''$ver''', 'installed': '''$have''',
+                  'update_available': '''$ver''' != '''$have''' and bool('''$ver'''),
+                  'running_slot': '''$(running_slot || echo '')''',
+                  'committed_slot': '''$(committed_slot)'''}, indent=2))"
+}
+
+cmd_apply() {
+    [ "$(id -u)" = 0 ] || die "must run as root"
+    local reboot=0
+    for a in "$@"; do [ "$a" = --reboot ] && reboot=1; done
+
+    local run target dev tmp ver url sum size
+    run=$(running_slot) || die "this system does not boot from a labelled slot;
+       it predates A/B and cannot take an OS update."
+    target=$(other_slot "$run")
+    dev=$(slot_dev "$target")
+    [ -b "$dev" ] || die "slot $target has no device (looked for label ds-root-$target)"
+    [ "$dev" != "$(findmnt -no SOURCE /)" ] || die "refusing: that is the running slot"
+
+    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+    fetch_os_manifest "$tmp"
+    ver=$(manifest_field "$tmp/os.json" version)
+    url=$(manifest_field "$tmp/os.json" url)
+    sum=$(manifest_field "$tmp/os.json" sha256)
+    [ -n "$ver" ] && [ -n "$url" ] && [ -n "$sum" ] \
+        || die "OS manifest is missing version, url or sha256"
+    [ "$ver" != "$(installed_os)" ] || note "already on $ver; reinstalling it"
+
+    note "target    : slot $target ($dev)"
+    note "version   : $ver"
+
+    # Space check before the download, not after: filling the data partition
+    # and *then* discovering it is a miserable way to find out.
+    local need avail
+    need=$(manifest_field "$tmp/os.json" size); need=${need:-0}
+    avail=$(df -B1 --output=avail /var/tmp 2>/dev/null | tail -1)
+    if [ -n "$avail" ] && [ "$need" -gt 0 ] && [ "$avail" -lt "$((need + 200*1024*1024))" ]; then
+        die "not enough room to stage the image: need about $((need/1048576)) MB
+       plus headroom, have $((avail/1048576)) MB free."
+    fi
+
+    note "downloading"
+    curl -fsSL --max-time 3600 -o "$tmp/rootfs.squashfs" "$url" \
+        || die "download failed: $url"
+    note "verifying"
+    local got; got=$(sha256sum "$tmp/rootfs.squashfs" | cut -d' ' -f1)
+    [ "$got" = "$sum" ] || die "checksum mismatch -- refusing to install.
+       expected $sum
+       got      $got"
+
+    # Everything below here writes to the inactive slot only.
+    local mnt="$tmp/slot"
+    mkdir -p "$mnt"
+    umount "$mnt" 2>/dev/null || true
+    note "formatting slot $target"
+    mkfs.ext4 -F -q -L "ds-root-$target" -m 1 "$dev" || die "mkfs failed on $dev"
+    mount "$dev" "$mnt" || die "cannot mount $dev"
+
+    note "unpacking"
+    unsquashfs -f -d "$mnt" "$tmp/rootfs.squashfs" >/dev/null 2>&1 \
+        || { umount "$mnt"; die "unsquashfs failed"; }
+
+    # The new slot must describe itself. Take the running fstab and swap only
+    # the root line: that keeps the ESP and data UUIDs and every bind mount
+    # exactly as the installer wrote them, instead of reinventing them here and
+    # getting one subtly wrong.
+    if [ -f /etc/fstab ]; then
+        sed "s|^LABEL=ds-root-[ab][[:space:]]|LABEL=ds-root-$target  |" \
+            /etc/fstab > "$mnt/etc/fstab"
+    fi
+
+    # Stable kernel names, so the ESP config never has to know a version.
+    local kver
+    kver=$(basename "$(ls -1 "$mnt"/boot/vmlinuz-* 2>/dev/null | head -1)" \
+           2>/dev/null | sed 's/^vmlinuz-//')
+    if [ -n "$kver" ]; then
+        ln -sf "vmlinuz-$kver"    "$mnt/boot/vmlinuz"
+        ln -sf "initrd.img-$kver" "$mnt/boot/initrd.img"
+    fi
+    echo "$ver" > "$mnt/etc/kiosk/os-version" 2>/dev/null || true
+
+    # Refuse to arm a slot that cannot boot. Rollback would save the machine
+    # anyway, but an update that is *known* to fail should not be attempted:
+    # it costs a reboot and hands the operator a mystery.
+    [ -e "$mnt/boot/vmlinuz" ] && [ -e "$mnt/boot/initrd.img" ] \
+        || { umount "$mnt"; die "the unpacked slot has no kernel -- not arming it"; }
+
+    sync; umount "$mnt"
+
+    note "arming slot $target for one attempt"
+    grub-editenv "$GRUBENV" set ds_try="$target" \
+        || die "could not arm the boot attempt; the slot is written but not selected"
+    mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
+    printf '{"staged":"%s","slot":"%s","at":"%s"}\n' "$ver" "$target" "$(date -Is)" \
+        > "$STATE" 2>/dev/null || true
+
+    echo "slot $target holds $ver and will be tried at the next boot."
+    echo "If it does not come up, the next boot returns to slot $run by itself."
+    if [ "$reboot" = 1 ]; then
+        note "rebooting"
+        sleep 2; reboot
+    fi
+}
+
+cmd_commit() {
+    [ "$(id -u)" = 0 ] || die "must run as root"
+    local run com
+    run=$(running_slot) || die "not running from a labelled slot"
+    com=$(committed_slot)
+    if [ "$run" = "$com" ]; then
+        echo "already committed to slot $run"
+        return 0
+    fi
+    grub-editenv "$GRUBENV" set ds_slot="$run" || die "could not commit slot $run"
+    grub-editenv "$GRUBENV" unset ds_try 2>/dev/null || true
+    echo "committed slot $run (was $com)"
+}
+
+case "${1:-status}" in
+    status) cmd_status ;;
+    check)  cmd_check ;;
+    apply)  shift; cmd_apply "$@" ;;
+    commit) cmd_commit ;;
+    *) echo "usage: kiosk-osupdate {status|check|apply [--reboot]|commit}" >&2
+       exit 1 ;;
+esac

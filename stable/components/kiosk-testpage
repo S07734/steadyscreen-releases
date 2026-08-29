@@ -1,0 +1,156 @@
+#!/usr/bin/python3
+"""Compose the SteadyScreen printer test page as a PDF.
+
+Drawn for paper, not reused from the screen.
+
+The boot splash is light artwork on a dark background, which is right on a
+display and wrong on a receipt: thermal printers lay down black, so an
+inverted screen splash becomes a slab of ink -- slow, wasteful, and hard on
+the head. It also loses the parts that matter. Measured on the real artwork,
+`steadyscreen.com` is 18 pixels tall in an 880-pixel image, so at 576-dot
+paper width it lands at about six pixels and cannot be read at any dither.
+
+So: the logo mark comes from the splash's **alpha channel**, which is exactly
+the artwork and nothing else -- no background to invert, no colour to wash
+out -- and every piece of text is rendered natively at a size chosen for
+paper.
+
+    kiosk-testpage /path/out.pdf [--width 576]
+"""
+import json
+import os
+import sys
+
+DPI = 203
+WIDTHS = {"80": 576, "58": 384}
+SPLASH = "/usr/share/plymouth/themes/kiosk/splash.png"
+FONT_DIR = "/usr/share/fonts/truetype/dejavu"
+IDENTITY = "/etc/kiosk/identity.json"
+
+
+def font(size, bold=True):
+    from PIL import ImageFont
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    try:
+        return ImageFont.truetype(os.path.join(FONT_DIR, name), size)
+    except Exception:                                         # noqa: BLE001
+        return ImageFont.load_default()
+
+
+def logo_mark(width):
+    """The mark from the splash, as black line art on white, or None.
+
+    The first band of opaque pixels is the mark. Found by scanning the alpha
+    channel rather than by hard-coded coordinates, so a redesigned splash does
+    not silently print the wrong crop.
+    """
+    try:
+        from PIL import Image, ImageOps
+    except Exception:                                         # noqa: BLE001
+        return None
+    try:
+        sp = Image.open(SPLASH).convert("RGBA")
+    except Exception:                                         # noqa: BLE001
+        return None
+    alpha = sp.getchannel("A")
+    w, h = alpha.size
+    px = alpha.load()
+    rows = [sum(px[x, y] for x in range(0, w, 3)) for y in range(h)]
+    peak = max(rows) or 1
+    top = bottom = None
+    for y, v in enumerate(rows):
+        if v > peak * 0.01:
+            if top is None:
+                top = y
+            bottom = y
+        elif top is not None and y - bottom > 20:
+            break                                   # end of the first band
+    if top is None:
+        return None
+    band = alpha.crop((0, top, w, bottom + 1))
+    box = band.getbbox()
+    if not box:
+        return None
+    mark = ImageOps.invert(band.crop(box))          # opaque -> black
+    return mark.resize((width, int(mark.height * width / mark.width)),
+                       Image.LANCZOS)
+
+
+def main():
+    out = sys.argv[1] if len(sys.argv) > 1 else "/tmp/steadyscreen-test.pdf"
+    dots = WIDTHS["80"]
+    if "--width" in sys.argv:
+        try:
+            dots = int(sys.argv[sys.argv.index("--width") + 1])
+        except (IndexError, ValueError):
+            pass
+
+    from PIL import Image, ImageDraw
+
+    try:
+        ident = json.load(open(IDENTITY))
+    except Exception:                                         # noqa: BLE001
+        ident = {}
+
+    mark = logo_mark(int(dots * 0.66))
+    page = Image.new("L", (dots, 1000), 255)
+    d = ImageDraw.Draw(page)
+    y = 8
+
+    def centre(text, f, gap=10):
+        nonlocal y
+        w = d.textbbox((0, 0), text, font=f)[2]
+        d.text(((dots - w) // 2, y), text, font=f, fill=0)
+        y += d.textbbox((0, 0), text, font=f)[3] + gap
+
+    if mark is not None:
+        page.paste(mark, ((dots - mark.width) // 2, y))
+        y += mark.height + 16
+    centre("SteadyScreen", font(int(dots * 0.094)), 12)
+    centre("steadyscreen.com", font(int(dots * 0.062), False), 22)
+
+    d.line([(0, y), (dots, y)], fill=0, width=3)
+    y += 16
+    centre("Printer test page", font(int(dots * 0.052)), 16)
+
+    # A grey ramp is the honest check that the filter dithers rather than
+    # thresholds: a threshold prints this as two blocks, not eight.
+    small = font(int(dots * 0.042), False)
+    d.text((14, y), "Grey ramp", font=small, fill=0)
+    y += 30
+    steps, pad = 8, 14
+    bw = (dots - pad * 2) // steps
+    for i in range(steps):
+        v = int(255 - i * (255 / (steps - 1)))
+        d.rectangle([pad + i * bw, y, pad + (i + 1) * bw - 3, y + 52], fill=v)
+    y += 66
+
+    d.text((14, y), "Hairlines", font=small, fill=0)
+    y += 30
+    for i, weight in enumerate((5, 4, 3, 2, 1)):
+        d.line([(14, y + i * 11), (dots - 14, y + i * 11)], fill=0,
+               width=weight)
+    y += 64
+
+    # Reverse text: the head has to lay solid black and leave paper for glyphs.
+    d.rectangle([0, y, dots - 1, y + 48], fill=0)
+    d.text((16, y + 8), "REVERSE 0123456789", font=font(int(dots * 0.05)),
+           fill=255)
+    y += 62
+
+    for line in ("%s  %d dots  %d dpi" % ("80mm" if dots == 576 else "58mm",
+                                          dots, DPI),
+                 ident.get("name", ""),
+                 (ident.get("id", "") or "")[:36]):
+        if line:
+            d.text((14, y), line, font=small, fill=0)
+            y += 30
+
+    d.line([(0, y + 6), (dots, y + 6)], fill=0, width=3)
+    page.crop((0, 0, dots, min(y + 40, page.height))).save(
+        out, "PDF", resolution=DPI)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

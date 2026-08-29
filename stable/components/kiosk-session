@@ -1,0 +1,24 @@
+#!/bin/sh
+# X session for the kiosk: no window manager, no desktop, just the browser.
+# Started by ~/.xinitrc. If the browser dies it is restarted immediately.
+
+# never blank, never sleep, no screensaver
+xset s off
+xset s noblank
+xset -dpms
+
+# no bell, and no way to kill the server from the keyboard
+xset -b
+setxkbmap -option terminate:ctrl_alt_bksp 2>/dev/null || true
+
+# black root window so nothing flashes white during a restart
+# the splash colour, not black: one continuous background from plymouth
+# through X to the first page
+xsetroot -solid "#12141a"
+
+while : ; do
+    /usr/local/bin/kiosk.py
+    code=$?
+    echo "kiosk: browser exited ($code), restarting in 2s" >&2
+    sleep 2
+done
