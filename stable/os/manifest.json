@@ -1,0 +1,8 @@
+{
+  "version": "1",
+  "software": "b1.10.0",
+  "sha256": "746e64021704a3b39047e0e010e0fe88108db32619ab26c79173fc4de0d003a4",
+  "size": 747732992,
+  "url": "https://github.com/S07734/steadyscreen-releases/releases/download/os-1/steadyscreen-rootfs-1.squashfs",
+  "released": "2026-08-29T15:19:03-05:00"
+}

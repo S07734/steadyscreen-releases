@@ -1,0 +1,86 @@
+#!/bin/sh
+# Receipt-printer plumbing for the display client.
+#
+#   kiosk-printer list                 queues CUPS knows about
+#   kiosk-printer detect               USB/network printers CUPS can see
+#   kiosk-printer add NAME URI [PPD]   add a queue (raw if no PPD given)
+#   kiosk-printer default NAME
+#   kiosk-printer test NAME
+#
+# The TM-T88V driver (GPL-3, groolot/epson-tm-t88v-driver) is built into the
+# image: filter /usr/lib/cups/filter/rastertotmt88v plus its PPD. Use
+# `add-tmt88v` and the queue can render an HTML page, unlike a raw queue.
+set -eu
+[ "$(id -u)" = 0 ] || { echo "must run as root" >&2; exit 1; }
+have() { command -v "$1" >/dev/null; }
+have lpstat || { echo "cups-client not installed" >&2; exit 1; }
+
+TMT88V_PPD=/usr/share/cups/model/epson-thermal-printer/epson-tm-t88v-rastertotmt88v.ppd
+
+case "${1:-list}" in
+add-tmt88v)
+    name="${2:-TM-T88V}"
+    uri="${3:-}"
+    [ -f "$TMT88V_PPD" ] || { echo "TM-T88V PPD not installed" >&2; exit 1; }
+    if [ -z "$uri" ]; then
+        # first USB or socket device CUPS can see that looks like an Epson
+        # Plain single quotes. This line used to carry '"'"' sequences --
+        # correct when a script is being written from inside another quoted
+        # string, wrong once it is the file itself. The shell then expanded
+        # awk's $2 as its own second argument, and with `set -u` and no second
+        # argument the helper died with "2: parameter not set". Add TM-T88V
+        # could therefore never have worked.
+        uri=$(lpinfo -v 2>/dev/null | awk '/usb:/ {print $2; exit}')
+        [ -n "$uri" ] || { echo "no USB printer found; pass a URI" >&2
+                           lpinfo -v 2>/dev/null | sed "s/^/  /" >&2; exit 1; }
+    fi
+    lpadmin -p "$name" -v "$uri" -P "$TMT88V_PPD" -E
+    lpadmin -d "$name"
+    cupsenable "$name" 2>/dev/null || true
+    cupsaccept "$name" 2>/dev/null || true
+    echo "added $name -> $uri using the TM-T88V driver"
+    ;;
+list)
+    lpstat -a 2>/dev/null || echo "(no queues)"
+    echo "default=$(lpstat -d 2>/dev/null | sed 's/.*: *//')"
+    ;;
+detect)
+    lpinfo -v 2>/dev/null | grep -viE '^network (socket|http|https|ipp|lpd)$' || true
+    ;;
+add)
+    name="${2:?name}"; uri="${3:?uri}"; ppd="${4:-}"
+    if [ -n "$ppd" ] && [ -f "$ppd" ]; then
+        lpadmin -p "$name" -v "$uri" -P "$ppd" -E
+        echo "added $name with $ppd"
+    else
+        # -m raw: bytes straight through, which is right for ESC/POS and
+        # useless for printing an HTML page.
+        lpadmin -p "$name" -v "$uri" -m raw -E
+        echo "added $name as a RAW queue (ESC/POS only, cannot render HTML)"
+    fi
+    lpadmin -d "$name"
+    cupsenable "$name" 2>/dev/null || true
+    cupsaccept "$name" 2>/dev/null || true
+    ;;
+default) lpadmin -d "${2:?name}"; echo "default is now ${2}" ;;
+test)
+    name="${2:-$(lpstat -d 2>/dev/null | sed 's/.*: *//')}"
+    [ -n "$name" ] || { echo "no printer" >&2; exit 1; }
+    # A queue with a PPD renders a page; a raw queue takes bytes and nothing
+    # else. Sending a PDF to a raw queue prints pages of garbage, so ask which
+    # kind this is rather than assume.
+    if [ -f "/etc/cups/ppd/$name.ppd" ] && command -v python3 >/dev/null; then
+        tmp=$(mktemp /tmp/ss-test-XXXX.pdf)
+        if python3 /usr/local/sbin/kiosk-testpage "$tmp" 2>/dev/null; then
+            lp -d "$name" "$tmp" >/dev/null && echo "sent the test page to $name"
+            rm -f "$tmp"; exit 0
+        fi
+        rm -f "$tmp"
+        echo "could not build the branded page, falling back to text" >&2
+    fi
+    printf 'SteadyScreen test print\n%s\n\n\n' "$(date)" | lp -d "$name" -
+    echo "sent a plain test page to $name"
+    ;;
+*) echo "usage: kiosk-printer {list|detect|add|add-tmt88v|default|test}" >&2
+   exit 1 ;;
+esac
