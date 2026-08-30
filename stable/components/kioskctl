@@ -1,0 +1,44 @@
+#!/bin/sh
+# Tiny CLI wrapper around the Display System admin API, for use over ssh or on tty2.
+PORT=$(sed -n 's/.*"admin_port"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' /etc/kiosk/config.json)
+: "${PORT:=8080}"
+API="http://127.0.0.1:$PORT"
+case "$1" in
+  url)     [ -n "$2" ] || { echo "usage: kioskctl url <URL>"; exit 1; }
+           curl -sS -X POST "$API/api/url" -H 'content-type: application/json' \
+                -d "{\"url\":\"$2\"}"; echo ;;
+  reload)  curl -sS -X POST "$API/api/reload"; echo ;;
+  hard)    curl -sS -X POST "$API/api/reload-hard"; echo ;;
+  restart) curl -sS -X POST "$API/api/restart"; echo ;;
+  zoom)    curl -sS -X POST "$API/api/settings" -H 'content-type: application/json' \
+                -d "{\"zoom\":$2}"; echo ;;
+  wifi)
+    case "$2" in
+      scan|"") curl -sS "$API/api/wifi/scan" | python3 -m json.tool ;;
+      join)    [ -n "$3" ] || { echo "usage: kioskctl wifi join <SSID> [password]"; exit 1; }
+               curl -sS -X POST "$API/api/wifi/connect" \
+                    -H 'content-type: application/json' \
+                    -d "{\"ssid\":\"$3\",\"password\":\"${4:-}\"}" | python3 -m json.tool ;;
+      forget)  curl -sS -X POST "$API/api/wifi/forget" \
+                    -H 'content-type: application/json' -d "{\"ssid\":\"$3\"}"; echo ;;
+      status)  curl -sS "$API/api/net" | python3 -m json.tool ;;
+      *) echo "usage: kioskctl wifi [scan|join <SSID> [pass]|forget <SSID>|status]"; exit 1 ;;
+    esac ;;
+  name)
+    if [ -n "$2" ]; then sudo -n /usr/local/sbin/kiosk-set-name "$2"
+    else cat /etc/kiosk/identity.json; fi ;;
+  password)
+    curl -sS -X POST "$API/api/admin-password" -H 'content-type: application/json' \
+         -d "{\"password\":\"${2:-}\"}"; echo ;;
+  resolution|res)
+    if [ -n "${2:-}" ]; then
+      curl -sS -X POST "$API/api/resolution" -H 'content-type: application/json' \
+           -d "{\"mode\":\"$2\"}"; echo
+    else
+      curl -sS "$API/api/display" | python3 -m json.tool
+    fi ;;
+  selftest) curl -sS -X POST "$API/api/url" -H 'content-type: application/json' \
+                 -d "{\"url\":\"http://127.0.0.1:$PORT/selftest\"}"; echo ;;
+  status|"") curl -sS "$API/api/status" | python3 -m json.tool ;;
+  *) echo "usage: kioskctl [status|url <URL>|reload|hard|restart|zoom <n>|selftest|wifi ...|password <pw>|name [new]|resolution [WxH|auto]]"; exit 1 ;;
+esac

@@ -1,0 +1,32 @@
+{
+  "version": "b1.12.1",
+  "channel": "stable",
+  "requires_os": "0",
+  "released": "2026-08-29T20:59:21-05:00",
+  "components": {
+    "kiosk.py": {"sha256": "6e3692f349b01e92f694fa7623b657f5b6a50e11c3acefc245bb64b94d6f2e99", "size": 231040},
+    "kioskctl": {"sha256": "9b4a6f28cc4e5fb554dd22faacb07943b9116c2055fde0a87918a0bb88e486da", "size": 2367},
+    "kiosk-session": {"sha256": "9fdabc9fef2a21897930a4d0e4cce3fea3e9bb428c78e552a706127e6ae58e65", "size": 1362},
+    "kiosk-splash": {"sha256": "839240f786375309615bc878ed6b14cc0950df4126b14121d05ff6bb580679a5", "size": 3711},
+    "kiosk-set-name": {"sha256": "6b87f382a0c1afd55cf9abc4f958c813e36c6f3876471871b2fa26f1912ca286", "size": 1650},
+    "kiosk-sshd-auth": {"sha256": "430fa7388774c620b9fd9984aee33b0149ea3e0981765ceb89e5c91a408acd5f", "size": 504},
+    "kiosk-passwd": {"sha256": "e43147ae725fdecae8d95a1872c907da6be7f2732382aac3bb6859832ff0bbb9", "size": 828},
+    "kiosk-cec": {"sha256": "c030b3348c230ff872455c0086ac1f7d499b68231cd42d4251b321b8364635c8", "size": 2576},
+    "kiosk-audio": {"sha256": "8d623226b9c95e498d2c343ac016b49a309d20798c5e3f2c4aaab630e556c665", "size": 9408},
+    "kiosk-printer": {"sha256": "3c33b2f4b1a05cf69b9a43b28472d0d871c70ba68064d7623a1fd7160bd44d33", "size": 3767},
+    "kiosk-deploy": {"sha256": "29727e19ad1573cbb2314decba622f941a8fa480ad5d97461e7fbb1e29b239ca", "size": 6460},
+    "kiosk-update": {"sha256": "6a72acfbe91184b1f1f58ab566782e163c0234baeb8caa87188a7e39e3b256e3", "size": 15121},
+    "kiosk-diag": {"sha256": "fc5269009164da36c18fa0d3f9ce837d6b83afb3bc21c0af7644604fd0e8ae30", "size": 4152},
+    "sudoers": {"sha256": "5b94614878289c4acb0b95340b1e9e21e276f5228050412276536378f509abdf", "size": 1203},
+    "escpos-filter": {"sha256": "9b0a4d4e7cdfb35c4c0ff04a1017db75e57f04d60f19be678b8dda4d83750390", "size": 6024},
+    "escpos-ppd": {"sha256": "eb317a42e15856591a6c6f9383ef8fffba26a236444eb9d5b7b24ad6d99f7588", "size": 1807},
+    "kiosk-testpage": {"sha256": "c93dab358eebaa61733739e7e406ebcc87b4b094a3179ab0e2b9c5c71b4335db", "size": 5402},
+    "kiosk-hwid": {"sha256": "f05ae7f233b878bf1f1f2a7c741feca2edc6106d2c8490e66233545b68221c17", "size": 6056},
+    "kiosk-osupdate": {"sha256": "d1e0fb59f4c392dd9a21149a350abab6f9e90db891516990ee115a2b63f3259a", "size": 18110},
+    "kiosk-migrate-boot": {"sha256": "9162222e7b165c0da64632f26029bc5f590c605e5106ceb9851b54bab14bf14c", "size": 20881},
+    "grub-ab.cfg": {"sha256": "a83dab3993497cf1f7aff6b43d5138f4be2000085393953c4e3032a3389f6009", "size": 2582},
+    "bash_profile": {"sha256": "efdf5e4b3b9a107831823759eca90b7462274f088eeac9d7fb28e2aca45f4f32", "size": 1157},
+    "osk.js": {"sha256": "8d5e2bb223a4f542aa5aef1a65b499f1742cd6e9ac691a590363baf31b65e608", "size": 14130},
+    "tone.py": {"sha256": "4c26069966356dfd01bff70b08cac759d56650c7c74276af776ef1a583bc2da8", "size": 3189}
+  }
+}
