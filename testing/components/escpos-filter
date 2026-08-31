@@ -1,0 +1,198 @@
+#!/usr/bin/python3
+"""CUPS filter: rendered page in, ESC/POS raster out.
+
+This is the bridge between WebKit and a thermal printer. WebKit prints a page,
+CUPS hands it here as PDF, and this emits the `GS v 0` raster command that
+essentially every ESC/POS thermal printer understands -- Epson, Bixolon, Star
+in ESC/POS mode, and the generic 58/80 mm units. A raw queue cannot do this on
+its own: raw means "send these bytes untouched", and a rendered page is not
+ESC/POS bytes.
+
+Why PDF in rather than CUPS raster: the exact dot width matters on thermal
+paper, and taking PDF lets this control the rasterisation itself instead of
+accepting whatever width the chain upstream chose. 80 mm paper is 576 dots and
+58 mm is 384, at the 203 dpi every one of these printers uses.
+
+Deliberately not a driver for any particular printer. `GS v 0` is the common
+subset, so this replaces a per-model driver rather than adding another one --
+which also gets the GPL-3 TM-T88V driver off the image.
+
+CUPS calls filters as:  filter job user title copies options [file]
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+ESC = b"\x1b"
+GS = b"\x1d"
+
+# 203 dpi is universal on these printers. Printable dots, not paper width:
+# 80 mm paper prints 72 mm, 58 mm paper prints 48 mm.
+DPI = 203
+WIDTHS = {"80": 576, "58": 384}
+DEFAULT_DOTS = 576
+
+# Most printers accept a very tall single raster, but some choke well before
+# the 65535 the protocol allows, and a short chunk costs nothing.
+CHUNK_ROWS = 128
+
+
+def log(msg):
+    # CUPS collects stderr into the job log; the DEBUG prefix keeps it out of
+    # the operator's face unless they go looking.
+    print("DEBUG: rastertoescpos: %s" % msg, file=sys.stderr)
+
+
+# Set per client by `kiosk-printer width`, measured with `kiosk-printer ruler`.
+PRINTER_CFG = "/etc/kiosk/printer.json"
+
+
+def configured_dots():
+    """This client's printable width for the queue being printed to.
+
+    Per queue, with a client-wide default behind it. One number per client was
+    fine while a display had one printer and wrong as soon as it had two: the
+    TM-T88V on .63 is set to 64 mm and prints 512 dots, the TP200 beside it
+    takes more, and whichever loses prints short without saying anything.
+
+    cupsd puts the queue name in PRINTER for every filter it runs -- `PRINTER=%s`
+    is in the daemon binary -- so the filter can look up its own queue rather
+    than being told by whoever submitted the job. That matters because the
+    caller that counts is a store's web page calling window.print(), which
+    knows nothing about any of this.
+    """
+    queue = os.environ.get("PRINTER", "")
+    try:
+        with open(PRINTER_CFG) as fh:
+            cfg = json.load(fh)
+        if not isinstance(cfg, dict):
+            return None
+    except Exception:                                         # noqa: BLE001
+        return None
+
+    def ok(v):
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            return None
+        return v if 128 <= v <= 1024 else None
+
+    if queue:
+        val = ok((cfg.get("queues") or {}).get(queue, {}).get("width_dots"))
+        if val is not None:
+            return val
+    return ok(cfg.get("width_dots"))
+
+
+def dots_from_options(opts):
+    """Dot width: the job's own option, else this client's, else 80 mm."""
+    for token in opts.replace(",", " ").split():
+        key, _, val = token.partition("=")
+        key = key.lower()
+        if key in ("escposwidth", "escpos-width", "widthdots") and val.isdigit():
+            return int(val)
+        if key in ("pagesize", "media"):
+            for name, dots in WIDTHS.items():
+                if name in val:
+                    return dots
+    return configured_dots() or DEFAULT_DOTS
+
+
+def render(path, dots):
+    """PDF -> 1-bit rows of exactly `dots` width, via pdftoppm."""
+    from PIL import Image
+
+    with tempfile.TemporaryDirectory() as tmp:
+        stem = os.path.join(tmp, "p")
+        # -gray, not -mono. A thermal head is one bit per dot either way, but
+        # -mono thresholds: every pixel is simply above or below a cutoff, so
+        # a logo with any gradient in it prints as black blobs. Rendering grey
+        # and letting PIL dither (Floyd-Steinberg, which convert("1") does by
+        # default) turns those gradients into stipple, which is what makes
+        # graphics readable on receipt paper.
+        #
+        # -scale-to-x pins the dot width so the page lands at exactly the
+        # right size whatever the HTML claimed.
+        subprocess.run(
+            ["pdftoppm", "-gray", "-r", str(DPI), "-scale-to-x", str(dots),
+             "-scale-to-y", "-1", path, stem],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        pages = sorted(f for f in os.listdir(tmp) if f.startswith("p"))
+        if not pages:
+            raise RuntimeError("pdftoppm produced no pages")
+        for page in pages:
+            img = Image.open(os.path.join(tmp, page)).convert("1")   # dithers
+            if img.width != dots:                      # pad, never scale again
+                canvas = Image.new("1", (dots, img.height), 1)
+                canvas.paste(img, (0, 0))
+                img = canvas
+            yield img
+
+
+def escpos_raster(img):
+    """One page as GS v 0 chunks. In PIL mode '1', 0 is black; ESC/POS wants
+    a 1 bit where it should fire the head, so the sense is inverted."""
+    width, height = img.size
+    row_bytes = (width + 7) // 8
+    px = img.load()
+    out = bytearray()
+    for top in range(0, height, CHUNK_ROWS):
+        rows = min(CHUNK_ROWS, height - top)
+        out += GS + b"v0" + bytes([0])
+        out += bytes([row_bytes & 0xFF, (row_bytes >> 8) & 0xFF])
+        out += bytes([rows & 0xFF, (rows >> 8) & 0xFF])
+        for y in range(top, top + rows):
+            packed = bytearray(row_bytes)
+            for x in range(width):
+                if not px[x, y]:                       # 0 == black == print it
+                    packed[x >> 3] |= 0x80 >> (x & 7)
+            out += packed
+    return bytes(out)
+
+
+def main():
+    if len(sys.argv) < 6:
+        print("ERROR: usage: rastertoescpos job user title copies options [file]",
+              file=sys.stderr)
+        return 1
+    opts = sys.argv[5] or ""
+    dots = dots_from_options(opts)
+    cut = "nocut" not in opts.lower()
+    log("width %d dots, cut=%s" % (dots, cut))
+
+    src = sys.argv[6] if len(sys.argv) > 6 else None
+    tmp_pdf = None
+    if not src:
+        # Job arrived on stdin; pdftoppm needs a seekable file.
+        fd, tmp_pdf = tempfile.mkstemp(suffix=".pdf")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(sys.stdin.buffer.read())
+        src = tmp_pdf
+
+    out = sys.stdout.buffer
+    try:
+        out.write(ESC + b"@")                          # reset to a known state
+        for img in render(src, dots):
+            out.write(escpos_raster(img))
+            out.write(ESC + b"d" + bytes([4]))         # feed clear of the head
+            if cut:
+                out.write(GS + b"V" + bytes([66, 0]))  # partial cut
+        out.flush()
+    except subprocess.CalledProcessError as exc:
+        print("ERROR: could not rasterise the page: %s"
+              % (exc.stderr or b"").decode("utf-8", "replace")[:200],
+              file=sys.stderr)
+        return 1
+    except Exception as exc:                           # noqa: BLE001
+        print("ERROR: %s" % exc, file=sys.stderr)
+        return 1
+    finally:
+        if tmp_pdf:
+            os.unlink(tmp_pdf)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
