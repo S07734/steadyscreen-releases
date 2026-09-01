@@ -1,0 +1,35 @@
+#!/bin/sh
+# X session for the kiosk: no window manager, no desktop, just the browser.
+# Started by ~/.xinitrc. If the browser dies it is restarted immediately.
+
+# never blank, never sleep, no screensaver
+xset s off
+xset s noblank
+xset -dpms
+
+# no bell, and no way to kill the server from the keyboard
+xset -b
+setxkbmap -option terminate:ctrl_alt_bksp 2>/dev/null || true
+
+# black root window so nothing flashes white during a restart
+# the splash colour, not black: one continuous background from plymouth
+# through X to the first page
+xsetroot -solid "#12141a"
+
+# One line of Debian appears over the retained splash on every boot without
+# this. /etc/motd being empty is only half the job: pam_motd also prints
+# /run/motd.dynamic, and login suppresses that only when ~/.hushlogin exists.
+#
+# It has to be created here, on the client, rather than in the image:
+# /home/kiosk is bind-mounted from /data, so the copy build-rootfs.sh puts in
+# the squashfs is hidden by the mount, and an install that keeps the data
+# partition never gets one. No component update can carry a dotfile either.
+# Creating it here heals every existing machine on its next boot.
+[ -e "$HOME/.hushlogin" ] || : > "$HOME/.hushlogin" 2>/dev/null || true
+
+while : ; do
+    /usr/local/bin/kiosk.py
+    code=$?
+    echo "kiosk: browser exited ($code), restarting in 2s" >&2
+    sleep 2
+done
