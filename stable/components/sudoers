@@ -1,0 +1,22 @@
+# The kiosk app runs as the unprivileged "kiosk" user and exposes power,
+# network, clock, display, printing and account controls on its admin page.
+#
+# kiosk-deploy is NOT general "install any file anywhere": it only accepts a
+# fixed list of component names, validates syntax before replacing anything,
+# and rolls kiosk.py back if the browser fails to come up.
+kiosk ALL=(root) NOPASSWD: /sbin/reboot, /sbin/poweroff, /usr/bin/nmcli, \
+                           /usr/bin/timedatectl, \
+                           /usr/local/sbin/kiosk-sshd-auth, \
+                           /usr/local/sbin/kiosk-set-name, \
+                           /usr/local/sbin/kiosk-splash, \
+                           /usr/local/sbin/kiosk-passwd, \
+                           /usr/local/sbin/kiosk-cec, \
+                           /usr/local/sbin/kiosk-audio, \
+                           /usr/local/sbin/kiosk-printer, \
+                           /usr/local/sbin/kiosk-deploy, \
+                           /usr/local/sbin/kiosk-update, \
+                           /usr/local/sbin/kiosk-osupdate, \
+                           /usr/local/sbin/kiosk-screenconnect, \
+                           /usr/local/sbin/kiosk-migrate-boot, \
+                           /usr/local/sbin/kiosk-diag, \
+                           /usr/local/sbin/kiosk-snapshot

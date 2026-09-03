@@ -1,0 +1,66 @@
+#!/bin/sh
+# HDMI-CEC control for the display client, via the kernel CEC API (cec-ctl).
+#
+#   kiosk-cec detect      list adapters, or say why there are none
+#   kiosk-cec on          wake the display and make us the active source
+#   kiosk-cec off         put the display into standby
+#   kiosk-cec scan        what else is on the CEC bus
+#
+# Most x86 machines do NOT wire the CEC pin on their HDMI port -- Intel's
+# driver exposes /dev/cecN on only some chipsets. If `detect` finds nothing,
+# a USB adapter (Pulse-Eight and similar) is the usual answer.
+set -eu
+DEV="${KIOSK_CEC_DEV:-}"
+
+find_dev() {
+    [ -n "$DEV" ] && { echo "$DEV"; return; }
+    for d in /dev/cec*; do [ -e "$d" ] && { echo "$d"; return; }; done
+    return 1
+}
+
+have_tool() { command -v cec-ctl >/dev/null; }
+
+case "${1:-detect}" in
+detect)
+    if ! have_tool; then echo "tool=missing"; echo "adapters=0"; exit 0; fi
+    echo "tool=ok"
+    n=0
+    for d in /dev/cec*; do
+        [ -e "$d" ] || continue
+        n=$((n + 1))
+        name=$(cec-ctl -d "$d" 2>/dev/null | sed -n 's/^\s*Driver *: *//p' | head -1)
+        adap=$(cec-ctl -d "$d" 2>/dev/null | sed -n 's/^\s*Adapter *: *//p' | head -1)
+        echo "adapter=$d driver=${name:-unknown} name=${adap:-unknown}"
+    done
+    echo "adapters=$n"
+    # Whether an HDMI display is actually attached. The CEC device node comes
+    # from the driver, not from a handshake with a TV -- but on i915 the
+    # adapter is registered per connector, so a machine with nothing plugged
+    # into HDMI is an inconclusive test, not a proven "no CEC".
+    for c in /sys/class/drm/card*-HDMI*; do
+        [ -e "$c/status" ] || continue
+        echo "hdmi=$(basename "$c") status=$(cat "$c/status")"
+    done
+    ;;
+on)
+    d=$(find_dev) || { echo "no CEC adapter" >&2; exit 1; }
+    cec-ctl -d "$d" --playback >/dev/null 2>&1 || true
+    cec-ctl -d "$d" --to 0 --image-view-on >/dev/null 2>&1
+    cec-ctl -d "$d" --active-source phys-addr="$(cec-ctl -d "$d" 2>/dev/null \
+        | sed -n 's/.*Physical Address *: *//p' | head -1)" >/dev/null 2>&1 || true
+    echo "display woken via $d"
+    ;;
+off)
+    d=$(find_dev) || { echo "no CEC adapter" >&2; exit 1; }
+    cec-ctl -d "$d" --playback >/dev/null 2>&1 || true
+    cec-ctl -d "$d" --to 0 --standby >/dev/null 2>&1
+    echo "display put into standby via $d"
+    ;;
+scan)
+    d=$(find_dev) || { echo "no CEC adapter" >&2; exit 1; }
+    cec-ctl -d "$d" --playback >/dev/null 2>&1 || true
+    cec-ctl -d "$d" -S 2>/dev/null | head -40
+    ;;
+*)
+    echo "usage: kiosk-cec {detect|on|off|scan}" >&2; exit 1 ;;
+esac

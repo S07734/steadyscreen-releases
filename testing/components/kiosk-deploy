@@ -1,0 +1,173 @@
+#!/bin/bash
+# Install a Display System component sent on stdin, validate it, and roll back
+# if the client fails to come up afterwards.
+#
+#   cat kiosk.py | sudo kiosk-deploy kiosk.py
+#
+# Deliberately NOT "sudo install anything anywhere": the component name is
+# checked against a fixed table, so granting this through sudoers does not
+# hand out arbitrary root file writes.
+set -uo pipefail
+# `kiosk-deploy list` prints the whole table: name, destination, mode.
+#
+# It exists so nothing else has to keep a second copy of where each component
+# lives. kiosk-osupdate needs exactly that when it carries software forward
+# onto a new slot, and a duplicated table is the kind that drifts silently --
+# the copy nobody runs is always the one that is wrong. Printed rather than
+# sourced, so a caller in any language can read it.
+if [ "${1:-}" = list ]; then
+    sed -n 's/^  \([a-z][A-Za-z0-9._-]*\))  *DEST=\([^ ;]*\).*MODE=\([0-7]*\).*/\1 \2 \3/p' "$0"
+    # The two-line entries the one-liner above cannot see. Kept here rather
+    # than reformatted into it, because reflowing the table to suit its own
+    # parser is how the table stops being readable.
+    printf '%s\n' \
+        "grub-ab.cfg /usr/local/share/steadyscreen/grub-ab.cfg 0644" \
+        "osk.js /usr/local/share/steadyscreen/osk.js 0644" \
+        "tone.py /usr/local/share/steadyscreen/tone.py 0644" \
+        "avahi-service /etc/avahi/services/steadyscreen.service 0644" \
+        "escpos-ppd /usr/share/cups/model/steadyscreen-escpos.ppd 0644"
+    exit 0
+fi
+
+[ "$(id -u)" = 0 ] || { echo "must run as root" >&2; exit 1; }
+
+BACKUP=/usr/local/lib/kiosk/backup
+mkdir -p "$BACKUP"
+
+case "${1:-}" in
+  kiosk.py)         DEST=/usr/local/bin/kiosk.py;              MODE=0755; KIND=py ;;
+  kioskctl)         DEST=/usr/local/bin/kioskctl;              MODE=0755; KIND=sh ;;
+  kiosk-session)    DEST=/usr/local/bin/kiosk-session;         MODE=0755; KIND=sh ;;
+  kiosk-splash)     DEST=/usr/local/sbin/kiosk-splash;         MODE=0755; KIND=sh ;;
+  kiosk-set-name)   DEST=/usr/local/sbin/kiosk-set-name;       MODE=0755; KIND=sh ;;
+  kiosk-sshd-auth)  DEST=/usr/local/sbin/kiosk-sshd-auth;      MODE=0755; KIND=sh ;;
+  kiosk-passwd)     DEST=/usr/local/sbin/kiosk-passwd;         MODE=0755; KIND=sh ;;
+  kiosk-cec)        DEST=/usr/local/sbin/kiosk-cec;            MODE=0755; KIND=sh ;;
+  kiosk-audio)      DEST=/usr/local/sbin/kiosk-audio;          MODE=0755; KIND=sh ;;
+  kiosk-printer)    DEST=/usr/local/sbin/kiosk-printer;        MODE=0755; KIND=sh ;;
+  kiosk-screenconnect) DEST=/usr/local/sbin/kiosk-screenconnect; MODE=0755; KIND=sh ;;
+  kiosk-testpage)   DEST=/usr/local/sbin/kiosk-testpage;       MODE=0755; KIND=py ;;
+  kiosk-hwid)       DEST=/usr/local/sbin/kiosk-hwid;           MODE=0755; KIND=py ;;
+  kiosk-deploy)     DEST=/usr/local/sbin/kiosk-deploy;         MODE=0755; KIND=sh ;;
+  kiosk-update)     DEST=/usr/local/sbin/kiosk-update;         MODE=0755; KIND=sh ;;
+  kiosk-osupdate)   DEST=/usr/local/sbin/kiosk-osupdate;       MODE=0755; KIND=sh ;;
+  kiosk-migrate-boot) DEST=/usr/local/sbin/kiosk-migrate-boot;  MODE=0755; KIND=sh ;;
+  grub-ab.cfg)      DEST=/usr/local/share/steadyscreen/grub-ab.cfg
+                    MODE=0644; KIND=grubcfg ;;
+  osk.js)           DEST=/usr/local/share/steadyscreen/osk.js
+                    MODE=0644; KIND=js ;;
+  tone.py)          DEST=/usr/local/share/steadyscreen/tone.py
+                    MODE=0644; KIND=py ;;
+  kiosk-diag)       DEST=/usr/local/sbin/kiosk-diag;           MODE=0755; KIND=sh ;;
+  kiosk-netwatch)   DEST=/usr/local/sbin/kiosk-netwatch;       MODE=0755; KIND=py ;;
+  kiosk-snapshot)   DEST=/usr/local/sbin/kiosk-snapshot;       MODE=0755; KIND=sh ;;
+  sudoers)          DEST=/etc/sudoers.d/kiosk;                 MODE=0440; KIND=sudoers ;;
+  escpos-filter)    DEST=/usr/lib/cups/filter/rastertoescpos;   MODE=0755; KIND=py ;;
+  avahi-service)    DEST=/etc/avahi/services/steadyscreen.service
+                    MODE=0644; KIND=any ;;
+  escpos-ppd)       DEST=/usr/share/cups/model/steadyscreen-escpos.ppd
+                    MODE=0644; KIND=any ;;
+  readme)           DEST=/home/kiosk/README.md;                MODE=0644; KIND=any ;;
+  bash_profile)     DEST=/home/kiosk/.bash_profile;           MODE=0644; KIND=sh ;;
+  *) echo "usage: kiosk-deploy <component>  (component read from stdin)" >&2
+     echo "known: kiosk.py kioskctl kiosk-session kiosk-splash kiosk-set-name kiosk-update kiosk-diag kiosk-snapshot" >&2
+     echo "       kiosk-netwatch" >&2
+     echo "       kiosk-sshd-auth kiosk-passwd kiosk-cec kiosk-audio" >&2
+     echo "       kiosk-printer kiosk-testpage" >&2
+     echo "       kiosk-deploy kiosk-osupdate kiosk-migrate-boot grub-ab.cfg" >&2
+     echo "       sudoers readme" >&2
+     echo "       escpos-filter escpos-ppd avahi-service" >&2
+     exit 1 ;;
+esac
+
+mkdir -p "$(dirname "$DEST")"
+TMP=$(mktemp); trap 'rm -f "$TMP"' EXIT
+cat > "$TMP"
+[ -s "$TMP" ] || { echo "nothing on stdin" >&2; exit 1; }
+
+# Validate before replacing anything. A broken sudoers file locks you out of
+# root entirely; a broken kiosk.py takes the screen down.
+case "$KIND" in
+  py)      python3 -m py_compile "$TMP" || { echo "python syntax error, refusing" >&2; exit 1; } ;;
+  sh)      bash -n "$TMP" 2>/dev/null || sh -n "$TMP" || { echo "shell syntax error, refusing" >&2; exit 1; } ;;
+  sudoers) visudo -cf "$TMP" >/dev/null || { echo "sudoers syntax error, refusing" >&2; exit 1; } ;;
+  # A truncated boot config is the one file here that can leave a machine
+  # unbootable with nothing to read the error from. Check it says what it
+  # has to say before it replaces the copy the migration will install.
+  grubcfg) grep -q 'ds_slot' "$TMP" && grep -q 'menuentry' "$TMP" \
+             || { echo "that is not the A/B arbiter, refusing" >&2; exit 1; } ;;
+  # A broken keyboard script is injected into a customer-facing page, so it is
+  # checked before it can get there. node is not on a client, so this is the
+  # cheapest honest check: it must look like the file we meant to send.
+  js)      grep -q '__dsOsk' "$TMP" \
+             || { echo "that is not the on-screen keyboard, refusing" >&2; exit 1; } ;;
+esac
+
+[ -f "$DEST" ] && cp -a "$DEST" "$BACKUP/$(basename "$DEST").prev"
+install -m "$MODE" "$TMP" "$DEST"
+[ "$KIND" = py ] && rm -rf /usr/local/bin/__pycache__ 2>/dev/null
+echo "installed $DEST"
+
+# Only kiosk.py can take the screen down, so only it gets the restart-and-check.
+[ "${1:-}" = kiosk.py ] || exit 0
+
+# ...unless there is no client to restart yet.
+#
+# The installer applies staged software into a freshly unpacked root, inside a
+# chroot, on a machine whose display has never started. The health check below
+# would find nothing listening, wait its full thirty seconds, and then ROLL
+# BACK the file it had just installed correctly -- turning every deploy into a
+# silent no-op and leaving the image's own older copy in place. An env var
+# rather than a flag, so nothing about the command line changes and no caller
+# can pass it by accident.
+if [ -n "${KIOSK_DEPLOY_OFFLINE:-}" ]; then
+    echo "offline: installed without restarting (no client is running yet)"
+    exit 0
+fi
+
+port=$(sed -n 's/.*"admin_port"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' \
+       /etc/kiosk/config.json 2>/dev/null | head -1); : "${port:=80}"
+
+# The health check below decides whether to roll kiosk.py back, so it must not
+# be able to miss a client that is up. Try every port the client could be on,
+# not just the configured one -- during the move to port 80 the config and the
+# reality briefly disagree, and a false negative here reverts a good update.
+alive() {
+    for _c in "$port" 80 8080; do
+        [ -n "$_c" ] || continue
+        curl -fsS -m 2 -o /dev/null "http://127.0.0.1:$_c/api/status" \
+            2>/dev/null && return 0
+    done
+    return 1
+}
+
+pkill -f 'local/bin/[k]iosk\.py' 2>/dev/null
+for i in $(seq 1 30); do
+    sleep 1
+    if alive; then
+        echo "kiosk came back after ${i}s"
+        exit 0
+    fi
+done
+
+echo "kiosk did NOT come back within 30s" >&2
+# Distinguish "the payload is broken" from "there is no display to run on".
+# Rolling back cannot fix a missing X server, and blaming the file sends you
+# looking in the wrong place.
+if ! pgrep -x Xorg >/dev/null 2>&1; then
+    echo "NOTE: no Xorg process is running - the X session is down, so no" >&2
+    echo "      version of kiosk.py can start. Reboot the machine; this is" >&2
+    echo "      not a fault in the file just deployed." >&2
+fi
+echo "rolling back" >&2
+if [ -f "$BACKUP/kiosk.py.prev" ]; then
+    install -m 0755 "$BACKUP/kiosk.py.prev" "$DEST"
+    pkill -f 'local/bin/[k]iosk\.py' 2>/dev/null
+    for i in $(seq 1 30); do
+        sleep 1
+        alive && {
+            echo "rolled back to the previous version" >&2; exit 2; }
+    done
+    echo "rollback also failed - needs hands on the machine" >&2
+fi
+exit 2

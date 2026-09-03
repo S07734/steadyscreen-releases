@@ -1,0 +1,482 @@
+#!/bin/bash
+# Move a client installed before 2026-08-28 onto the ESP-resident A/B arbiter.
+#
+#   kiosk-migrate-boot check       report what would change; touches nothing
+#   kiosk-migrate-boot apply       do it, verify it, roll back if verification fails
+#   kiosk-migrate-boot rollback    put back what the last apply replaced
+#
+# Installs before commit 8848d93 put GRUB's prefix and config *inside* slot A
+# and named the root filesystem by UUID. That is an arbiter living inside one
+# of the two things it arbitrates: slot B could never boot, so those machines
+# cannot take an OS update at all. This moves the prefix, the config and the
+# environment onto the ESP -- shared by both slots -- and renames the root by
+# label, which is the only name that survives a slot being reimaged.
+#
+# It rewrites the boot path of a machine that is running right now, possibly one
+# nobody can drive to. So: everything it replaces is backed up to /data first
+# (which outlives both slots), every precondition is checked before the first
+# write, and if the post-checks do not pass it restores the backup itself rather
+# than leaving a half-migrated machine to be discovered at the next power cut.
+set -uo pipefail
+
+BACKUP_ROOT=/data/boot-migration
+ESP_MNT=/boot/efi
+ESP_BOOT="$ESP_MNT/boot"
+ESP_GRUB="$ESP_BOOT/grub"
+AB_CFG_SRC=/usr/local/share/steadyscreen/grub-ab.cfg
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+note() { printf '    %s\n' "$*"; }
+head_() { printf '\n== %s\n' "$*"; }
+
+# --- what we are looking at ------------------------------------------------
+
+ROOT_SRC=""; ROOT_LABEL=""; ROOT_PARTLABEL=""; SLOT=""
+DISK=""; ROOT_PARTNUM=""; ESP_SRC=""; FIRMWARE=""; KVER=""
+
+discover() {
+    ROOT_SRC=$(findmnt -no SOURCE / 2>/dev/null) \
+        || die "cannot determine the root device"
+    case "$ROOT_SRC" in
+        /dev/mapper/*|/dev/dm-*|/dev/md*)
+            die "root is on LVM or RAID ($ROOT_SRC). This migration only
+       understands a plain partition, and a display machine should not have
+       either. Refusing." ;;
+    esac
+    [ -b "$ROOT_SRC" ] || die "root device $ROOT_SRC is not a block device"
+
+    ROOT_LABEL=$(blkid -s LABEL -o value "$ROOT_SRC" 2>/dev/null)
+    ROOT_PARTLABEL=$(lsblk -no PARTLABEL "$ROOT_SRC" 2>/dev/null | head -1)
+    DISK=$(lsblk -no PKNAME "$ROOT_SRC" 2>/dev/null | head -1)
+    [ -n "$DISK" ] || die "cannot find the disk holding $ROOT_SRC"
+    DISK="/dev/$DISK"
+    [ -b "$DISK" ] || die "$DISK is not a block device"
+    ROOT_PARTNUM=$(lsblk -no PARTN "$ROOT_SRC" 2>/dev/null | head -1)
+
+    # The slot we are running. Prefer the filesystem label; fall back to the
+    # partition label, which the installer has always written, and which is
+    # evidence rather than a guess. Never assume "a".
+    case "$ROOT_LABEL" in
+        ds-root-a) SLOT=a ;;
+        ds-root-b) SLOT=b ;;
+        "") case "$ROOT_PARTLABEL" in
+                ds-root-a) SLOT=a ;;
+                ds-root-b) SLOT=b ;;
+            esac ;;
+    esac
+    [ -n "$SLOT" ] || die "the root filesystem is neither labelled nor
+       partition-labelled ds-root-a/ds-root-b (label='$ROOT_LABEL'
+       partlabel='$ROOT_PARTLABEL'). This is not a SteadyScreen A/B layout and
+       cannot be migrated -- reinstall from a current image instead."
+
+    ESP_SRC=$(findmnt -no SOURCE "$ESP_MNT" 2>/dev/null) \
+        || die "$ESP_MNT is not mounted; nothing can be written to the ESP"
+    local esp_fs
+    esp_fs=$(findmnt -no FSTYPE "$ESP_MNT" 2>/dev/null)
+    [ "$esp_fs" = vfat ] || die "$ESP_MNT is $esp_fs, not vfat"
+
+    FIRMWARE=bios
+    if [ -d /sys/firmware/efi ]; then
+        case "$(cat /sys/firmware/efi/fw_platform_size 2>/dev/null)" in
+            32) FIRMWARE=uefi32 ;;
+            *)  FIRMWARE=uefi64 ;;
+        esac
+    fi
+
+    # The kernel we are running is the one kernel we know boots on this
+    # machine. Only fall back to "newest on disk" if it has been removed.
+    KVER=$(uname -r)
+    if [ ! -f "/boot/vmlinuz-$KVER" ]; then
+        KVER=$(ls -1 /boot/vmlinuz-* 2>/dev/null \
+               | sed 's|.*/vmlinuz-||' | sort -V | tail -1)
+    fi
+    [ -n "$KVER" ] && [ -f "/boot/vmlinuz-$KVER" ] \
+        || die "no kernel found in /boot -- refusing to touch the boot path"
+    [ -f "/boot/initrd.img-$KVER" ] \
+        || die "/boot/initrd.img-$KVER is missing; the slot has a kernel with
+       no initramfs and would not boot"
+}
+
+already_migrated() {
+    [ -f "$ESP_GRUB/grub.cfg" ] && grep -q 'ds_slot' "$ESP_GRUB/grub.cfg" 2>/dev/null
+}
+
+fstab_root_field() {
+    awk '$0 !~ /^[[:space:]]*#/ && NF>=2 && $2=="/" {print $1; exit}' /etc/fstab
+}
+
+ab_cfg() {
+    # One source of truth. The image ships it; kiosk-deploy can send it to a
+    # client that predates it. An embedded copy here would drift from the file
+    # the installer uses, and the two disagreeing is exactly the class of bug
+    # that leaves a machine unbootable.
+    if [ -f "$AB_CFG_SRC" ]; then echo "$AB_CFG_SRC"; return 0; fi
+    return 1
+}
+
+# --- check -----------------------------------------------------------------
+
+cmd_check() {
+    discover
+    head_ "This machine"
+    note "root        : $ROOT_SRC  (label='${ROOT_LABEL:-none}' partlabel='${ROOT_PARTLABEL:-none}')"
+    note "slot        : $SLOT"
+    note "disk        : $DISK   (root is partition ${ROOT_PARTNUM:-?})"
+    note "ESP         : $ESP_SRC on $ESP_MNT"
+    note "firmware    : $FIRMWARE"
+    note "kernel      : $KVER"
+    note "other slot  : $(blkid -c /dev/null -L "ds-root-$([ "$SLOT" = a ] && echo b || echo a)" 2>/dev/null || echo 'not labelled (kiosk-osupdate will label it when it writes)')"
+
+    head_ "Boot path now"
+    if already_migrated; then
+        note "ALREADY MIGRATED -- $ESP_GRUB/grub.cfg is the A/B arbiter"
+        note "committed slot: $(grub-editenv "$ESP_GRUB/grubenv" list 2>/dev/null | sed -n 's/^ds_slot=//p' | head -1)"
+    else
+        note "grub config : $( [ -f /boot/grub/grub.cfg ] && echo 'inside the slot at /boot/grub/grub.cfg' || echo 'not found' )"
+        note "ESP config  : $( [ -f "$ESP_GRUB/grub.cfg" ] && echo present || echo 'ABSENT -- slot B cannot boot' )"
+    fi
+    note "fstab root  : $(fstab_root_field)"
+    note "/boot/vmlinuz    : $( [ -e /boot/vmlinuz ] && readlink -f /boot/vmlinuz || echo 'MISSING -- the ESP config needs this' )"
+    note "/boot/initrd.img : $( [ -e /boot/initrd.img ] && readlink -f /boot/initrd.img || echo MISSING )"
+
+    head_ "What apply would need"
+    local src
+    if src=$(ab_cfg); then note "arbiter cfg : $src  OK"
+    else note "arbiter cfg : MISSING at $AB_CFG_SRC -- deploy it first:"
+         note "              cat kiosk/grub-ab.cfg | ssh <host> sudo kiosk-deploy grub-ab.cfg"
+    fi
+    for t in i386-pc x86_64-efi i386-efi; do
+        note "grub modules $t : $( [ -d "/usr/lib/grub/$t" ] && echo OK || echo 'absent (that target will be skipped)' )"
+    done
+    local need
+    case "$FIRMWARE" in
+        uefi64) need=x86_64-efi ;; uefi32) need=i386-efi ;; *) need=i386-pc ;;
+    esac
+    note "required for this firmware: $need"
+    [ -d "/usr/lib/grub/$need" ] \
+        || note "  ^^ MISSING. apply would refuse: this machine boots $FIRMWARE"
+    note "unicode font: not used (a signed GRUB refuses an unsigned font, and
+                 the refusal stops the boot -- see grub-ab.cfg)"
+    local espfree
+    espfree=$(df -Pk "$ESP_MNT" | awk 'NR==2{print int($4/1024)}')
+    note "ESP free    : ${espfree} MB"
+    [ "${espfree:-0}" -ge 20 ] || note "  ^^ under 20 MB; apply would refuse"
+    note "backups to  : $BACKUP_ROOT  ($(df -Ph /data 2>/dev/null | awk 'NR==2{print $4}') free)"
+    echo
+    if already_migrated; then
+        echo "Nothing to do."
+    else
+        echo "Run:  kiosk-migrate-boot apply"
+    fi
+}
+
+# --- apply -----------------------------------------------------------------
+
+BACKUP_DIR=""
+
+take_backup() {
+    BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$BACKUP_DIR" || die "cannot create $BACKUP_DIR"
+
+    # The ESP as it stands: bootloader binaries and whatever config is there.
+    tar -cf "$BACKUP_DIR/esp.tar" -C "$ESP_MNT" . 2>/dev/null \
+        || die "could not back up the ESP -- refusing to change it"
+    tar -tf "$BACKUP_DIR/esp.tar" >/dev/null 2>&1 \
+        || die "the ESP backup does not read back -- refusing to change anything"
+
+    cp -a /etc/fstab "$BACKUP_DIR/fstab"
+
+    # The first 2 MiB covers the MBR boot code and the whole bios_grub
+    # partition, which is where i386-pc puts core.img. A tar of the ESP cannot
+    # put those back.
+    dd if="$DISK" of="$BACKUP_DIR/disk-head.bin" bs=1M count=2 status=none \
+        || die "could not back up the start of $DISK"
+
+    { echo "migrated  : $(date -Is)"
+      echo "host      : $(hostname)"
+      echo "root      : $ROOT_SRC"
+      echo "slot      : $SLOT"
+      echo "disk      : $DISK"
+      echo "esp       : $ESP_SRC"
+      echo "firmware  : $FIRMWARE"
+      echo "kernel    : $KVER"
+      echo "fstab root: $(fstab_root_field)"
+    } > "$BACKUP_DIR/notes.txt"
+
+    ln -sfn "$BACKUP_DIR" "$BACKUP_ROOT/latest"
+    note "backup      : $BACKUP_DIR"
+}
+
+restore_backup() {
+    local d="$1"
+    [ -d "$d" ] || { echo "no backup at $d" >&2; return 1; }
+    [ -f "$d/esp.tar" ] && tar -tf "$d/esp.tar" >/dev/null 2>&1 \
+        || { echo "the backup at $d is not readable; NOT touching the ESP" >&2; return 1; }
+    note "restoring the ESP from $d/esp.tar"
+    find "$ESP_MNT" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+    tar -xf "$d/esp.tar" -C "$ESP_MNT" || { echo "restore FAILED" >&2; return 1; }
+    [ -f "$d/fstab" ] && cp -a "$d/fstab" /etc/fstab && note "restored /etc/fstab"
+    if [ -f "$d/disk-head.bin" ]; then
+        dd if="$d/disk-head.bin" of="$DISK" bs=1M count=2 conv=notrunc status=none \
+            && note "restored the first 2 MiB of $DISK"
+    fi
+    sync
+    return 0
+}
+
+verify() {
+    local need efi fail=0
+    case "$FIRMWARE" in
+        uefi64) need=x86_64-efi; efi="$ESP_MNT/EFI/BOOT/BOOTX64.EFI" ;;
+        uefi32) need=i386-efi;   efi="$ESP_MNT/EFI/BOOT/BOOTIA32.EFI" ;;
+        *)      need=i386-pc;    efi="" ;;
+    esac
+
+    [ -s "$ESP_GRUB/grub.cfg" ] || { echo "  FAIL no $ESP_GRUB/grub.cfg"; fail=1; }
+    grep -q 'ds_slot' "$ESP_GRUB/grub.cfg" 2>/dev/null \
+        || { echo "  FAIL the ESP grub.cfg is not the A/B arbiter"; fail=1; }
+    grep -q 'menuentry' "$ESP_GRUB/grub.cfg" 2>/dev/null \
+        || { echo "  FAIL the ESP grub.cfg has no menu entry"; fail=1; }
+
+    grub-editenv "$ESP_GRUB/grubenv" list 2>/dev/null | grep -q '^ds_slot=' \
+        || { echo "  FAIL grubenv has no ds_slot"; fail=1; }
+
+    [ -f "$ESP_GRUB/$need/normal.mod" ] \
+        || { echo "  FAIL no $need modules on the ESP"; fail=1; }
+
+    # There is deliberately NO font check here any more, and no font.
+    #
+    # The arbiter used to loadfont unicode.pf2 and switch to gfxterm; without
+    # the font it drew its box as question marks, so this checked for it. A
+    # Debian-signed GRUB refuses to load an unsigned font under Secure Boot --
+    # "error: prohibited by secure boot policy" -- and an error printed while
+    # a config is running makes GRUB WAIT FOR A KEYPRESS. On a display in a
+    # shop that is a machine stuck at a GRUB error screen until somebody
+    # drives to it. The font went, and this check with it.
+
+    if [ -n "$efi" ]; then
+        [ -s "$efi" ] || { echo "  FAIL $efi missing"; fail=1; }
+        # The whole point of the exercise: the binary must not still be
+        # pointing its prefix at a partition inside a slot.
+        #
+        # Both binaries, not just the removable one. The old install also made
+        # a named NVRAM entry, and if the firmware boots THAT and only the
+        # removable path was rewritten, the machine comes up perfectly on the
+        # old in-slot config and nothing looks wrong -- a silent un-migration,
+        # which is worse than a visible failure because the next OS update is
+        # the thing that finds out.
+        # Every binary on the ESP, not a list of the ones I thought of. A
+        # b16 install leaves FOUR -- BOOTX64.EFI, BOOTIA32.EFI, grub.efi and
+        # EFI/kiosk/grubx64.efi -- and any one of them the firmware happens to
+        # pick would boot the old in-slot config with nothing looking wrong.
+        local b stale
+        if [ -n "$ROOT_PARTNUM" ]; then
+            stale=$(grep -alr "gpt$ROOT_PARTNUM)/boot/grub" "$ESP_MNT/EFI" 2>/dev/null)
+            for b in $stale; do
+                echo "  FAIL $b still has its prefix inside slot $SLOT"; fail=1
+            done
+        fi
+    else
+        [ -f "$ESP_GRUB/i386-pc/core.img" ] \
+            || { echo "  FAIL no i386-pc core.img on the ESP"; fail=1; }
+    fi
+
+    [ -e /boot/vmlinuz ]    || { echo "  FAIL /boot/vmlinuz does not resolve"; fail=1; }
+    [ -e /boot/initrd.img ] || { echo "  FAIL /boot/initrd.img does not resolve"; fail=1; }
+
+    local by_label
+    by_label=$(blkid -c /dev/null -L "ds-root-$SLOT" 2>/dev/null)
+    [ -n "$by_label" ] && [ "$(readlink -f "$by_label")" = "$(readlink -f "$ROOT_SRC")" ] \
+        || { echo "  FAIL LABEL=ds-root-$SLOT does not resolve to $ROOT_SRC"; fail=1; }
+
+    case "$(fstab_root_field)" in
+        LABEL=ds-root-?) ;;
+        *) echo "  FAIL fstab still names root by something other than a slot label"; fail=1 ;;
+    esac
+
+    return $fail
+}
+
+cmd_apply() {
+    [ "$(id -u)" = 0 ] || die "must run as root"
+    discover
+
+    if already_migrated; then
+        echo "Already migrated -- $ESP_GRUB/grub.cfg is the A/B arbiter."
+        # But the copy on the ESP is the one that boots, and it was written
+        # once and never looked at again. grub-ab.cfg IS a published component,
+        # so kiosk-update happily replaces the source on disk while the file
+        # that actually boots the machine never changes -- and every check
+        # reports success. Compare them, and say so either way.
+        local src2
+        if src2=$(ab_cfg) && ! cmp -s "$src2" "$ESP_GRUB/grub.cfg"; then
+            cp "$src2" "$ESP_GRUB/grub.cfg" \
+                && { sync; echo "ESP arbiter was OUT OF DATE -- refreshed from $src2."
+                     echo "Reboot to use it."; }
+        else
+            echo "The ESP copy matches $AB_CFG_SRC. Nothing to do."
+        fi
+        return 0
+    fi
+
+    local src
+    src=$(ab_cfg) || die "no arbiter config at $AB_CFG_SRC.
+       Deploy it first, or this machine would be left with no boot config:
+         cat kiosk/grub-ab.cfg | ssh <host> sudo kiosk-deploy grub-ab.cfg"
+    grep -q 'ds_slot' "$src" || die "$src does not look like the A/B arbiter"
+
+    local need
+    case "$FIRMWARE" in
+        uefi64) need=x86_64-efi ;; uefi32) need=i386-efi ;; *) need=i386-pc ;;
+    esac
+    [ -d "/usr/lib/grub/$need" ] \
+        || die "this machine boots $FIRMWARE but /usr/lib/grub/$need is not
+       installed, so the bootloader it actually uses cannot be rewritten.
+       Install grub-efi-amd64-bin / grub-efi-ia32-bin / grub-pc-bin first."
+
+    local espfree
+    espfree=$(df -Pk "$ESP_MNT" | awk 'NR==2{print int($4/1024)}')
+    [ "${espfree:-0}" -ge 20 ] \
+        || die "only ${espfree} MB free on the ESP; refusing to write there"
+
+    head_ "Migrating slot $SLOT on $DISK ($FIRMWARE)"
+    take_backup
+
+    # 1. Label the filesystem if only the partition carried the name. Nothing
+    #    finds a slot by UUID after this, so the label has to be real.
+    if [ -z "$ROOT_LABEL" ]; then
+        e2label "$ROOT_SRC" "ds-root-$SLOT" \
+            || { restore_backup "$BACKUP_DIR"; die "could not label $ROOT_SRC"; }
+        ROOT_LABEL="ds-root-$SLOT"
+        note "labelled    : $ROOT_SRC -> ds-root-$SLOT"
+    fi
+
+    # 2. Slot-stable kernel names. The ESP config says /boot/vmlinuz, because a
+    #    config shared by both slots cannot know either slot's kernel version.
+    ln -sfn "vmlinuz-$KVER"    /boot/vmlinuz
+    ln -sfn "initrd.img-$KVER" /boot/initrd.img
+    note "kernel      : $KVER  (/boot/vmlinuz, /boot/initrd.img)"
+
+    # And keep them true. Debian's kernel hooks maintain these symlinks only
+    # when told to put them in /boot; the default puts them at / where nothing
+    # here reads them, so the next kernel upgrade would leave /boot/vmlinuz
+    # pointing at a kernel that had been removed.
+    if ! grep -qs '^[[:space:]]*link_in_boot[[:space:]]*=[[:space:]]*yes' /etc/kernel-img.conf; then
+        printf 'link_in_boot = yes\ndo_symlinks = yes\n' >> /etc/kernel-img.conf
+        note "kernel-img  : link_in_boot = yes (upgrades keep the symlinks true)"
+    fi
+
+    # 3. The bootloaders, with the prefix on the ESP instead of inside a slot.
+    #    All three targets, as the installer does: the firmware a machine
+    #    actually uses has been wrong twice on hardware that looked identical.
+    local ok_any=no
+    mkdir -p "$ESP_BOOT"
+    if [ -d /usr/lib/grub/i386-pc ]; then
+        if grub-install --target=i386-pc --recheck \
+                --boot-directory="$ESP_BOOT" "$DISK" >/dev/null 2>&1; then
+            note "i386-pc     -> MBR + BIOS boot partition   OK"; ok_any=yes
+        else
+            note "i386-pc     FAILED"
+        fi
+    fi
+    if [ -d /usr/lib/grub/x86_64-efi ]; then
+        if grub-install --target=x86_64-efi --efi-directory="$ESP_MNT" \
+                --boot-directory="$ESP_BOOT" --removable --recheck >/dev/null 2>&1; then
+            note "x86_64-efi  -> \\EFI\\BOOT\\BOOTX64.EFI     OK"; ok_any=yes
+        else
+            note "x86_64-efi  FAILED"
+        fi
+    fi
+    if [ -d /usr/lib/grub/i386-efi ]; then
+        if grub-install --target=i386-efi --efi-directory="$ESP_MNT" \
+                --boot-directory="$ESP_BOOT" --removable --recheck >/dev/null 2>&1; then
+            note "i386-efi    -> \\EFI\\BOOT\\BOOTIA32.EFI    OK"; ok_any=yes
+        else
+            note "i386-efi    FAILED"
+        fi
+    fi
+    case "$FIRMWARE" in
+        uefi64) grub-install --target=x86_64-efi --efi-directory="$ESP_MNT" \
+                    --boot-directory="$ESP_BOOT" --bootloader-id=kiosk --recheck \
+                    >/dev/null 2>&1 && note "NVRAM entry 'kiosk'            OK" ;;
+        uefi32) grub-install --target=i386-efi --efi-directory="$ESP_MNT" \
+                    --boot-directory="$ESP_BOOT" --bootloader-id=kiosk --recheck \
+                    >/dev/null 2>&1 && note "NVRAM entry 'kiosk'            OK" ;;
+    esac
+    [ "$ok_any" = yes ] || { restore_backup "$BACKUP_DIR"
+                             die "no bootloader could be installed; put back the backup"; }
+
+    # 4. The arbiter itself, written after grub-install so nothing overwrites it.
+    mkdir -p "$ESP_GRUB"
+    cp "$src" "$ESP_GRUB/grub.cfg" \
+        || { restore_backup "$BACKUP_DIR"; die "could not write the ESP grub.cfg"; }
+    # The font is not copied. See the check above: a signed GRUB will not load
+    # an unsigned one, and the refusal stops the boot rather than degrading it.
+    # Remove one left behind by an earlier migration, so a config that ever
+    # tries again finds nothing rather than something it must refuse.
+    rm -rf "$ESP_GRUB/fonts"
+    note "arbiter     : $ESP_GRUB/grub.cfg"
+
+    # 5. Commit the slot we are running. Not "a" -- the slot we are actually in.
+    grub-editenv "$ESP_GRUB/grubenv" create >/dev/null 2>&1
+    grub-editenv "$ESP_GRUB/grubenv" set ds_slot="$SLOT" >/dev/null 2>&1
+    grub-editenv "$ESP_GRUB/grubenv" unset ds_try >/dev/null 2>&1
+    note "committed   : slot $SLOT"
+
+    # 6. Name the root by label, so this fstab stays right when the other slot
+    #    is reimaged and nothing has to rewrite UUIDs across slots.
+    awk -v lbl="LABEL=ds-root-$SLOT" '
+        /^[[:space:]]*#/ { print; next }
+        NF>=2 && $2=="/"  { $1=lbl; print; next }
+        { print }' OFS='  ' /etc/fstab > /etc/fstab.migrate.$$ \
+        && mv /etc/fstab.migrate.$$ /etc/fstab \
+        || { rm -f /etc/fstab.migrate.$$; restore_backup "$BACKUP_DIR"
+             die "could not rewrite /etc/fstab"; }
+    note "fstab root  : LABEL=ds-root-$SLOT"
+
+    sync
+
+    head_ "Verifying"
+    if verify; then
+        note "all checks pass"
+    else
+        echo
+        echo "Verification FAILED. Putting the old boot path back."
+        restore_backup "$BACKUP_DIR"
+        die "migration rolled back; this machine still boots the way it did.
+       Nothing was left half-done. Send the output above."
+    fi
+
+    head_ "Done -- but not proven until it reboots"
+    cat <<EOF
+    The old boot path is saved at
+        $BACKUP_DIR
+    and can be put back with
+        kiosk-migrate-boot rollback
+
+    Reboot when you are ready:
+        sudo reboot
+    Then confirm with
+        kiosk-osupdate status
+    which should report slot $SLOT running and slot $SLOT committed.
+EOF
+}
+
+cmd_rollback() {
+    [ "$(id -u)" = 0 ] || die "must run as root"
+    discover
+    local d="${1:-$BACKUP_ROOT/latest}"
+    [ -d "$d" ] || die "no backup at $d"
+    head_ "Rolling back to $(readlink -f "$d")"
+    cat "$d/notes.txt" 2>/dev/null | sed 's/^/    /'
+    restore_backup "$d" || die "rollback failed"
+    echo
+    echo "    The old boot path is back. Reboot to use it."
+}
+
+case "${1:-check}" in
+    check)    cmd_check ;;
+    apply)    cmd_apply ;;
+    rollback) shift; cmd_rollback "${1:-}" ;;
+    *) echo "usage: kiosk-migrate-boot {check|apply|rollback [dir]}" >&2; exit 1 ;;
+esac
