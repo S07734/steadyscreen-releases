@@ -1,0 +1,327 @@
+#!/bin/bash
+# Install a ScreenConnect access agent from a pasted installer URL.
+#
+#   kiosk-screenconnect check   <url>     parse it, say what it would do
+#   kiosk-screenconnect install <url>     do it
+#
+# Paste any of the installer URLs the console gives you. The console offers
+# .exe, and there are .sh and .deb at the same path with the same query string.
+# This always uses the .deb, and the reason is worth writing down:
+#
+#   .exe is Windows.
+#   .sh  is macOS. Downloaded and read: it is pkgutil, .app bundles and
+#        launchctl from top to bottom. "Shell script" reads like the portable
+#        one and it is not; using it here would have put a 45 MB macOS
+#        installer on a Debian display.
+#   .deb is the Linux one. connectwisecontrol-<id>, Depends: java5-runtime,
+#        which openjdk-21 in this image provides, and it drops a unit at
+#        /etc/systemd/system/connectwisecontrol-<id>.service.
+#
+# Only the filename is swapped. Everything after the '?' is carried across
+# untouched, and that is the point: it holds the session name and the custom
+# fields, and an agent installed without them arrives in the console as an
+# unnamed machine somebody then has to identify by hand.
+#
+# ROOT IS REQUIRED. It installs a systemd unit and files under /opt. There is
+# no unprivileged form of this.
+set -uo pipefail
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+note() { printf '    %s\n' "$*"; }
+
+CMD="${1:-}"
+URL="${2:-}"
+[ -n "$CMD" ] && [ -n "$URL" ] || die "usage: kiosk-screenconnect {check|install} <url>"
+
+# What makes a link safe to install from is the CERTIFICATE, not a list.
+#
+# An earlier version of this asked the operator "trust this host?" and
+# remembered the answer, and a version after that made the server a root-only
+# setting the admin page could not change. Both were wrong in the same
+# direction: they treated the question as bookkeeping when it is answerable
+# outright.
+#
+# It is answerable because ScreenConnect's cloud presents an
+# organisation-validated certificate:
+#
+#   Issued to  CN = *.screenconnect.com,  O = ConnectWise, LLC
+#   Issued by  DigiCert Global G2 TLS RSA SHA256 2020 CA1
+#
+# A certificate authority issues O="ConnectWise, LLC" only after validating
+# the organisation, and will not issue one to somebody else for a domain they
+# control. So a host whose certificate chains to a public root, covers the
+# hostname being asked for, and carries that organisation IS ScreenConnect.
+# Nothing further has to be configured or remembered.
+#
+# Three things are checked, and all three must hold:
+#
+#   1. the certificate chain validates against the system trust store
+#   2. it covers this exact hostname, and carries O = ConnectWise, LLC
+#   3. the path is /Bin/ScreenConnect.ClientSetup.* -- an installer, not a
+#      file that merely lives on the same server
+#
+# The optional pin below is for anybody who wants to narrow it further to one
+# server. It is off unless configured, because the certificate already answers
+# the question this was invented to answer.
+CONF=/etc/kiosk/screenconnect.conf
+CONF_HOST=""
+CONF_INSTANCE=""
+CONF_ORG=""
+if [ -r "$CONF" ]; then
+    CONF_HOST=$(sed -n 's/^[[:space:]]*server[[:space:]]*=[[:space:]]*//p' "$CONF" | head -1 | tr -d ' \r')
+    CONF_INSTANCE=$(sed -n 's/^[[:space:]]*instance[[:space:]]*=[[:space:]]*//p' "$CONF" | head -1 | tr -d ' \r')
+    CONF_ORG=$(sed -n 's/^[[:space:]]*organization[[:space:]]*=[[:space:]]*//p' "$CONF" | head -1 | sed 's/[[:space:]]*$//')
+fi
+# A self-hosted server presents its owner's certificate rather than
+# ConnectWise's, so that case sets `organization =` to its own name, or to
+# `any`. Changing it is a root-only decision, not a button on a web page.
+[ -n "$CONF_ORG" ] || CONF_ORG="ConnectWise, LLC"
+
+# ---------------------------------------------------------------- parse it
+#
+# Deliberately strict. This ends in `sh` running whatever came back, so the
+# shape of the URL is the only thing standing between a paste and arbitrary
+# code -- and a paste is exactly how a wrong URL arrives.
+case "$URL" in
+    https://*) ;;
+    http://*)  die "refusing a plain-http installer URL. The agent is executed
+       as root on this display; it has to come over https." ;;
+    *)         die "that does not look like a URL" ;;
+esac
+
+rest=${URL#https://}
+HOST=${rest%%/*}
+PATH_AND_QUERY=/${rest#*/}
+BASEPATH=${PATH_AND_QUERY%%\?*}
+QUERY=""
+case "$PATH_AND_QUERY" in *\?*) QUERY=${PATH_AND_QUERY#*\?} ;; esac
+
+[ -n "$HOST" ] || die "no host in that URL"
+case "$BASEPATH" in
+    */Bin/ScreenConnect.ClientSetup.*) ;;
+    *) die "that is not a ScreenConnect installer URL.
+       Expected a path like /Bin/ScreenConnect.ClientSetup.exe
+       Got: $BASEPATH" ;;
+esac
+
+# -> .deb, whatever was pasted. See the note at the top: .sh is macOS.
+LINUX_PATH="${BASEPATH%.*}.deb"
+LINUX_URL="https://${HOST}${LINUX_PATH}"
+[ -n "$QUERY" ] && LINUX_URL="${LINUX_URL}?${QUERY}"
+
+# What the console will call this machine, pulled out only to show somebody
+# before they commit. `t=` is the session name; `c=` repeats, in the order the
+# instance defines its custom fields.
+sc_field() {
+    printf '%s' "$QUERY" | tr '&' '\n' | sed -n "s/^$1=//p" | head -1 \
+        | python3 -c 'import sys,urllib.parse; print(urllib.parse.unquote_plus(sys.stdin.read().strip()))' 2>/dev/null
+}
+
+# Who owns this host? Answered from the certificate, before anything is
+# downloaded, and reported so the page can show what was seen.
+#
+# -verify_hostname is the half that matters as much as the organisation: a
+# valid ConnectWise certificate presented for a hostname it does not cover is
+# a redirected or spoofed name, and openssl will not accept it here.
+CERT_CN=""
+CERT_ORG=""
+CERT_ISSUER=""
+CERT_EXPIRES=""
+verify_cert() {
+    local dir="$1" out verify
+    command -v openssl >/dev/null 2>&1 || {
+        note "openssl is not installed; cannot check who owns $HOST"
+        return 1
+    }
+    out=$(printf '' | timeout 30 openssl s_client -connect "$HOST:443" \
+            -servername "$HOST" -verify_hostname "$HOST" \
+            -verify_return_error -verify 6 2>&1)
+    if [ -z "$out" ]; then
+        note "could not reach $HOST on port 443"
+        return 1
+    fi
+    verify=$(printf '%s' "$out" | sed -n 's/^[[:space:]]*Verify return code: //p' | tail -1)
+    case "$verify" in
+        0*) ;;
+        *)  note "certificate did not validate: ${verify:-unknown}"; return 1 ;;
+    esac
+
+    printf '%s' "$out" | sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' > "$dir/host.pem"
+    [ -s "$dir/host.pem" ] || { note "no certificate came back from $HOST"; return 1; }
+    if ! openssl x509 -in "$dir/host.pem" -noout -checkend 0 >/dev/null 2>&1; then
+        note "the certificate for $HOST has expired"
+        return 1
+    fi
+
+    CERT_CN=$(openssl x509 -in "$dir/host.pem" -noout -subject -nameopt multiline 2>/dev/null \
+              | sed -n 's/^[[:space:]]*commonName[[:space:]]*=[[:space:]]*//p' | head -1)
+    CERT_ORG=$(openssl x509 -in "$dir/host.pem" -noout -subject -nameopt multiline 2>/dev/null \
+              | sed -n 's/^[[:space:]]*organizationName[[:space:]]*=[[:space:]]*//p' | head -1)
+    CERT_ISSUER=$(openssl x509 -in "$dir/host.pem" -noout -issuer -nameopt multiline 2>/dev/null \
+              | sed -n 's/^[[:space:]]*commonName[[:space:]]*=[[:space:]]*//p' | head -1)
+    CERT_EXPIRES=$(openssl x509 -in "$dir/host.pem" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')
+
+    if [ "$CONF_ORG" != any ] && [ "$CERT_ORG" != "$CONF_ORG" ]; then
+        note "certificate organisation is '${CERT_ORG:-none}', expected '$CONF_ORG'"
+        return 1
+    fi
+    return 0
+}
+
+CERTDIR=$(mktemp -d /tmp/sccert.XXXXXX) || die "could not make a temporary directory"
+trap 'rm -rf "$CERTDIR"' EXIT
+
+echo "ScreenConnect agent"
+note "server   : $HOST"
+
+CERT_OK=no
+if verify_cert "$CERTDIR"; then
+    CERT_OK=yes
+    note "certificate: CN=$CERT_CN, O=$CERT_ORG"
+    note "             issued by $CERT_ISSUER, valid to $CERT_EXPIRES"
+    note "             this host is $CERT_ORG's"
+else
+    note "certificate: DOES NOT prove this host belongs to $CONF_ORG"
+fi
+
+# The optional narrowing, off unless somebody configured it.
+PIN_OK=yes
+if [ -n "$CONF_HOST" ] \
+   && [ "$(printf '%s' "$HOST" | tr 'A-Z' 'a-z')" != "$(printf '%s' "$CONF_HOST" | tr 'A-Z' 'a-z')" ]; then
+    PIN_OK=no
+    note "pinned   : this display is pinned to $CONF_HOST"
+fi
+
+KNOWN=no
+[ "$CERT_OK" = yes ] && [ "$PIN_OK" = yes ] && KNOWN=yes
+
+if [ "$LINUX_PATH" = "$BASEPATH" ]; then
+    note "installer: $LINUX_PATH"
+else
+    note "installer: $LINUX_PATH"
+    note "           (was $(basename "$BASEPATH"); .exe is Windows and .sh is macOS."
+    note "            The query string is carried across unchanged.)"
+fi
+name=$(sc_field t); [ -n "$name" ] && note "name     : $name"
+if [ -n "$QUERY" ]; then
+    n=$(printf '%s' "$QUERY" | tr '&' '\n' | grep -c '^c=')
+    note "custom   : $n field(s) carried through unchanged"
+else
+    note "custom   : NONE -- this client will arrive unnamed and somebody will"
+    note "           have to work out which machine it is"
+fi
+
+if [ "$CMD" = check ]; then
+    [ "$KNOWN" = yes ] || note "this link will be refused"
+    exit 0
+fi
+[ "$CMD" = install ] || die "unknown command '$CMD'"
+
+if [ "$CERT_OK" != yes ]; then
+    die "the certificate for '$HOST' does not show it is operated by
+       '$CONF_ORG'. Nothing has been downloaded.
+
+       ScreenConnect's cloud presents an organisation-validated certificate
+       naming ConnectWise, and a certificate authority will not issue one to
+       anybody else for a domain they control. A host that cannot show one is
+       not ScreenConnect, whatever its address looks like.
+
+       A self-hosted server presents its owner's certificate instead: put that
+       organisation, or 'any', in $CONF, as root."
+fi
+
+if [ "$PIN_OK" != yes ]; then
+    die "this display is pinned to '$CONF_HOST' and that link is for '$HOST'.
+       Nothing has been downloaded. Change the pin in $CONF, as root."
+fi
+
+[ "$(id -u)" = 0 ] || die "install must run as root"
+
+# ------------------------------------------------------------------ do it
+command -v curl >/dev/null 2>&1 || die "curl is not installed"
+command -v apt-get >/dev/null 2>&1 || die "apt-get is not installed"
+
+TMP=$(mktemp -d /tmp/sc.XXXXXX) || die "could not make a temporary directory"
+trap 'rm -rf "$TMP"' EXIT
+
+
+# --proto '=https' so a redirect cannot walk this down to plain http, and no
+# --insecure anywhere: the certificate check is the reason trusting a host
+# means anything at all.
+# --fail so an HTML error page is not handed to sh, which is how "the server
+# said 404" becomes "syntax error near unexpected token".
+if ! curl -fsSL --proto '=https' --proto-redir '=https' \
+        --max-time 180 -o "$TMP/sc.deb" "$LINUX_URL"; then
+    die "could not download the agent from $HOST.
+       Nothing has been changed on this display."
+fi
+
+sz=$(stat -c %s "$TMP/sc.deb" 2>/dev/null || echo 0)
+[ "$sz" -gt 100000 ] || die "the download is only ${sz} bytes, which is not a package.
+       Nothing has been changed on this display."
+
+# Check it IS a package before handing it to dpkg. A login page or an error
+# saved as sc.deb is the likely wrong thing to arrive here, and dpkg's own
+# complaint about it is not one anybody should have to interpret.
+if ! dpkg-deb -I "$TMP/sc.deb" >"$TMP/info" 2>&1; then
+    die "what came back from $HOST is not a Debian package.
+       Nothing has been installed."
+fi
+pkg=$(sed -n 's/^ Package: //p' "$TMP/info" | head -1)
+# The vendor names every build of this connectwisecontrol-<instance id>. It is
+# not a signature and it is not pretending to be one -- anybody who can serve
+# you a package can name it anything. It catches the honest mistake: a URL
+# that resolves to some other Debian package entirely.
+case "$pkg" in
+    connectwisecontrol-*|screenconnect-*) ;;
+    *) die "that package is called '$pkg', which is not a ScreenConnect agent.
+       Nothing has been installed." ;;
+esac
+
+# The id after the dash is the ScreenConnect instance fingerprint, and every
+# agent from one server carries the same one. Pinning it catches a configured
+# host that has started serving a different instance's agent -- a redirect, a
+# hijacked DNS entry inside a trusted domain, a tenant change nobody mentioned.
+# It is NOT a signature: whoever serves the package chooses the name. It is a
+# second thing that has to line up, not a proof.
+if [ -n "$CONF_INSTANCE" ]; then
+    case "$pkg" in
+        *"$CONF_INSTANCE"*) ;;
+        *) die "this agent is for ScreenConnect instance '$pkg', and this display
+       expects '$CONF_INSTANCE'. Nothing has been installed." ;;
+    esac
+fi
+ver=$(sed -n 's/^ Version: //p' "$TMP/info" | head -1)
+note "package  : ${pkg:-unknown} ${ver:-}"
+
+echo "==> Installing"
+# apt-get, not dpkg -i: it resolves java5-runtime rather than leaving a
+# half-configured package for somebody else to find.
+if ! apt-get install -y --no-install-recommends "$TMP/sc.deb" >"$TMP/out" 2>&1; then
+    echo "--- installer output ---" >&2
+    tail -20 "$TMP/out" >&2
+    die "the ScreenConnect agent failed to install"
+fi
+tail -3 "$TMP/out" | sed 's/^/    /'
+
+# Report what is actually running, rather than that apt exited 0.
+sleep 4
+svc=$(systemctl list-units --type=service --all --no-legend 2>/dev/null \
+      | awk '/connectwisecontrol|screenconnect/ {print $1; exit}')
+if pgrep -f "/opt/connectwisecontrol.*ScreenConnect.Client.jar" >/dev/null 2>&1; then
+    echo "==> the agent is running${svc:+ ($svc)}"
+    # Record the instance id the first time, so a later install from the same
+    # configured host has a second thing to match. The host was already pinned
+    # by configuration, so this narrows rather than grants.
+    if [ -z "$CONF_INSTANCE" ] && [ -n "$pkg" ]; then
+        inst=${pkg#*-}
+        if [ -n "$inst" ]; then
+            printf 'instance = %s\n' "$inst" >> "$CONF" 2>/dev/null \
+                && echo "==> noted ScreenConnect instance $inst for future installs"
+        fi
+    fi
+else
+    echo "==> installed, but the agent process is not running" >&2
+    echo "    it may still be starting; check with: pgrep -af ScreenConnect.Client.jar" >&2
+    exit 1
+fi

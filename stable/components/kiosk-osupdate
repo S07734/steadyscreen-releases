@@ -1,0 +1,911 @@
+#!/bin/bash
+# A/B operating-system updates.
+#
+#   kiosk-osupdate status              which slot runs, which is committed
+#   kiosk-osupdate check               is a newer OS published?
+#   kiosk-osupdate apply [--reboot]    download, then write and arm the slot
+#   kiosk-osupdate commit              keep the slot we booted into
+#
+# The two halves of `apply`, separately, so a caller can stop between them:
+#
+#   kiosk-osupdate download            fetch and verify; writes no slot
+#   kiosk-osupdate cancel              stop a download, discard what is staged
+#   kiosk-osupdate install [--reboot]  write the slot from what was staged
+#
+# Cancelling is possible only during the download. Past that the slot is being
+# written, and stopping half way through a filesystem is how you get a slot
+# that neither boots nor says it will not.
+#
+# The running slot is never touched. A new system is unpacked into the *other*
+# slot, and the boot arbiter on the ESP is asked to try it once. If it comes up
+# and the client is healthy, `commit` makes that slot the committed one. If it
+# does not, nobody has to do anything: the one-shot was consumed at boot, so the
+# next boot returns to the committed slot on its own. That property is what
+# makes this safe to run on a machine nobody can drive to, and it is verified
+# in QEMU rather than assumed.
+#
+# Trust is the same chain as component updates: a signed manifest, verified
+# against the key shipped in the image, then a sha256 over the payload. TLS
+# authenticates the CDN, not us.
+set -uo pipefail
+
+CFG=/etc/kiosk/update.json
+SIGNERS=/etc/kiosk/update-signers
+NS=steadyscreen-release
+PRINCIPAL=releases@steadyscreen.com
+ESP_GRUB=/boot/efi/boot/grub
+GRUBENV="$ESP_GRUB/grubenv"
+STATE=/var/lib/kiosk/osupdate.json
+
+# Where the 700-odd MB payload is staged. NOT mktemp's default: /tmp on a
+# client is a 256 MB tmpfs, so downloading there fails at 256 MB -- and it
+# failed *past* a space check that was measuring /var/tmp, a different
+# filesystem entirely. The staging directory and the space check now come from
+# the same variable so they cannot drift apart again.
+STAGE="${OSUPDATE_STAGE:-/var/tmp}"
+
+# WORK is deliberately global. It used to be `local` inside each function while
+# the EXIT trap that removes it fired after the function had returned, so under
+# `set -u` the cleanup died with "tmp: unbound variable" and every run left its
+# directory behind -- a few KB for a check, most of a gigabyte for an apply.
+WORK=""
+cleanup_work() { [ -n "${WORK:-}" ] && rm -rf "$WORK"; return 0; }
+trap cleanup_work EXIT
+
+die() { echo "$*" >&2; exit 1; }
+note() { printf '    %s\n' "$*"; }
+
+# Where an apply says what it is doing, for anyone watching from outside.
+#
+# `apply` runs for minutes and then reboots the machine, so its stdout is never
+# read: whoever started it from the admin page loses the connection long before
+# the command returns. Without this the page can only say "working" for ten
+# minutes and hope, which is indistinguishable from a hang -- and the person
+# watching has no way to tell a slow unsquashfs from a wedged one.
+#
+# On /run deliberately: it is a tmpfs, so it is empty again after the reboot
+# and cannot be mistaken for the progress of a later run. Best-effort
+# throughout -- a machine that cannot write this file must still be able to
+# take the update.
+PROGRESS=/run/kiosk/osupdate-progress
+progress() {
+    mkdir -p "$(dirname "$PROGRESS")" 2>/dev/null || true
+    # Braces, not a bare redirect. `printf ... > "$P" 2>/dev/null` silences
+    # printf -- but the "No such file or directory" for an unwritable path is
+    # emitted by the SHELL, before printf runs, so it escapes to stderr. That
+    # stderr is what the admin page shows when an update fails, so a cosmetic
+    # complaint about a progress file would have been printed as the reason the
+    # operating system did not install.
+    { printf '%s\n' "$*" > "$PROGRESS"; } 2>/dev/null || true
+}
+phase() {
+    note "$*"
+    progress "$*"
+}
+
+cfg() {
+    python3 -c "
+import json
+try: c=json.load(open('$CFG'))
+except Exception: c={}
+print(c.get('$1', '''$2'''))
+" 2>/dev/null || echo "$2"
+}
+
+# The base URL the CHANNEL actually points at.
+#
+# `base_url` is written once at install time and names a channel directory
+# literally, so a client moved to testing still has ".../stable" on disk. The
+# software updater has always resolved that through `channel`; this one did
+# not, and read `base_url` raw. A testing client was therefore offered the
+# STABLE os -- on 2026-08-31 that was OS 1.2 carrying software b1.12.2, older
+# than the b1.13.25 the machine was already running. It would have installed,
+# verified, and silently rolled the client back thirteen releases, because
+# every signature and checksum along that path is perfectly valid. Nothing was
+# broken except which directory we asked.
+#
+# Same rewrite as kiosk-update's effective_base, and for the same reason it is
+# copied rather than shared: these two scripts must each stand alone on a
+# client. If you change one, change both.
+effective_base() {
+    local base ch
+    base=$(cfg base_url "")
+    base="${base%/}"
+    ch=$(cfg channel "")
+    case "$ch" in
+        stable|testing) ;;
+        *) echo "$base"; return ;;
+    esac
+    case "${base##*/}" in
+        stable|testing) echo "${base%/*}/$ch" ;;
+        *) echo "$base" ;;
+    esac
+}
+
+# --- slots ----------------------------------------------------------------
+
+running_slot() {
+    local src label
+    src=$(findmnt -no SOURCE / 2>/dev/null) || return 1
+    label=$(blkid -s LABEL -o value "$src" 2>/dev/null)
+    case "$label" in
+        ds-root-a) echo a ;;
+        ds-root-b) echo b ;;
+        *) return 1 ;;
+    esac
+}
+
+other_slot() { [ "$1" = a ] && echo b || echo a; }
+
+slot_dev() {
+    # By label, because that is the only name that stays true when a slot is
+    # reimaged. blkid needs a nudge after a mkfs, hence the -c /dev/null.
+    blkid -c /dev/null -L "ds-root-$1" 2>/dev/null
+}
+
+committed_slot() {
+    grub-editenv "$GRUBENV" list 2>/dev/null | sed -n 's/^ds_slot=//p' | head -1
+}
+
+pending_try() {
+    grub-editenv "$GRUBENV" list 2>/dev/null | sed -n 's/^ds_try=//p' | head -1
+}
+
+# --- the published OS -----------------------------------------------------
+
+fetch_os_manifest() {
+    local base tmp bust
+    base=$(effective_base)
+    [ -n "$base" ] || die "no base_url in $CFG"
+    tmp="$1"
+    bust=$(date +%s)
+    curl -fsS --max-time 30 -H "Cache-Control: no-cache" \
+         -o "$tmp/os.json"     "$base/os/manifest.json?t=$bust" \
+        || die "no OS manifest published at $base/os/"
+    curl -fsS --max-time 30 -H "Cache-Control: no-cache" \
+         -o "$tmp/os.json.sig" "$base/os/manifest.json.sig?t=$bust" \
+        || die "cannot fetch the OS manifest signature"
+    [ -f "$SIGNERS" ] || die "no trust anchor at $SIGNERS -- refusing"
+    ssh-keygen -Y verify -f "$SIGNERS" -I "$PRINCIPAL" -n "$NS" \
+        -s "$tmp/os.json.sig" < "$tmp/os.json" >/dev/null 2>&1 \
+        || die "OS manifest signature is NOT valid -- refusing"
+}
+
+manifest_field() {
+    python3 -c "
+import json,sys
+print(json.load(open(sys.argv[1])).get(sys.argv[2],''))" "$1" "$2" 2>/dev/null
+}
+
+# Which OS this slot is. Deliberately NOT under /etc/kiosk: that directory is
+# bind-mounted from /data, which is shared by both slots and survives an OS
+# update untouched. A marker there describes the machine's history, not the
+# filesystem it is sitting in -- so every slot would report the same version
+# for ever and "is there an update" could never be answered.
+#
+# The OS version is a plain integer that moves only when the root filesystem
+# must change. Anything non-numeric is a client from before the OS and the
+# software had separate versions, and reports 0 -- older than every numbered
+# OS, which is exactly what it is.
+OS_VERSION_FILE=/etc/steadyscreen-os-version
+SW_VERSION_FILE=/etc/steadyscreen-software-version
+
+# Compare two dotted OS versions component-wise: 1 < 1.1 < 1.2 < 1.10 < 2.
+#
+# NOT numerically. Read as a decimal, 1.10 is smaller than 1.9 -- the oldest
+# version bug there is, and the reason this is a shared helper rather than a
+# comparison written out three times in three places.
+#
+#   os_cmp A B  ->  prints -1, 0 or 1  (A older, same, A newer)
+os_cmp() {
+    OSA="${1:-0}" OSB="${2:-0}" python3 -c "
+import os, sys
+def parts(v):
+    v = (v or '0').strip()
+    out = []
+    for chunk in v.split('.'):
+        try: out.append(int(chunk))
+        except ValueError: return None          # not a version we can compare
+    return out or None
+a, b = parts(os.environ['OSA']), parts(os.environ['OSB'])
+if a is None or b is None:
+    # A marker from before OS versions were numbers. It is older than every
+    # numbered OS, which is what it is.
+    a = a or [0]; b = b or [0]
+    if os.environ['OSA'] and parts(os.environ['OSA']) is None: a = [0]
+    if os.environ['OSB'] and parts(os.environ['OSB']) is None: b = [0]
+n = max(len(a), len(b))
+a += [0] * (n - len(a)); b += [0] * (n - len(b))
+print(-1 if a < b else (0 if a == b else 1))"
+}
+
+# The OS this slot is, as written. Anything that is not digits-and-dots is a
+# client from before the OS and the software had separate versions; it reports
+# 0, older than every numbered OS, which is exactly what it is.
+normalise_os() {
+    case "$1" in
+        ''|*[!0-9.]*|.*|*.) echo 0 ;;
+        *) echo "$1" ;;
+    esac
+}
+
+installed_os() {
+    local v
+    v=$(cat "$OS_VERSION_FILE" 2>/dev/null || cat /etc/kiosk/os-version 2>/dev/null)
+    v=$(printf '%s' "$v" | tr -d ' \t\n')
+    normalise_os "$v"
+}
+
+# The software the running slot carries. Read from kiosk.py, which is the file
+# the component updater actually replaces, so this cannot drift from reality.
+installed_software() {
+    local v
+    v=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' /usr/local/bin/kiosk.py 2>/dev/null | head -1)
+    [ -n "$v" ] || v=$(cat "$SW_VERSION_FILE" 2>/dev/null | tr -d ' \t\n')
+    echo "${v:-unknown}"
+}
+
+# --- actions --------------------------------------------------------------
+
+# What is actually sitting in a slot, as "os <v> software <v>".
+#
+# The running slot answers from / without touching anything. The other has to
+# be mounted to be read, and it is mounted READ-ONLY, nodev, noexec: that
+# filesystem exists to be the way back, and a status command has no business
+# being able to write to it.
+#
+# Needs root for the mount, and the id check below is belt-and-braces rather
+# than a working degraded mode: `status` already needs root further up, where
+# running_slot calls blkid on the root device. Tested as the kiosk user and it
+# dies there, before reaching this, with the "does not boot from a labelled
+# slot" message -- which is misleading, but it is pre-existing and it is not
+# this function's to fix. Do not read the guard below as a promise that status
+# works unprivileged. It does not.
+slot_contents() {
+    local slot="$1" run dev mnt os sw
+    run=$(running_slot 2>/dev/null || echo '')
+    if [ -n "$run" ] && [ "$slot" = "$run" ]; then
+        echo "os $(installed_os) software $(installed_software)"
+        return 0
+    fi
+    dev=$(slot_dev "$slot")
+    if [ -z "$dev" ] || [ ! -b "$dev" ]; then
+        echo "no such slot"; return 0
+    fi
+    if [ "$(id -u)" != 0 ]; then
+        echo "unknown (needs root to read)"; return 0
+    fi
+    mnt=$(mktemp -d) || { echo "unknown"; return 0; }
+    os=""; sw=""
+    if mount -o ro,nodev,noexec "$dev" "$mnt" 2>/dev/null; then
+        os=$(cat "$mnt/etc/steadyscreen-os-version" 2>/dev/null | tr -d ' \t\n')
+        sw=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' \
+             "$mnt/usr/local/bin/kiosk.py" 2>/dev/null | head -1)
+        umount "$mnt" 2>/dev/null
+        rmdir "$mnt" 2>/dev/null
+    else
+        rmdir "$mnt" 2>/dev/null
+        # A slot that will not mount is the single most useful thing this
+        # command can tell anyone: it is why the machine came back on the old
+        # system, and it is what a reinstall would repair.
+        echo "empty or unreadable"; return 0
+    fi
+    echo "os $(normalise_os "$os") software ${sw:-unknown}"
+}
+
+# Compare two software versions: prints 1 if the first is newer.
+#
+# Same rule as kiosk-update's version_direction, which is where the fleet's
+# idea of "newer" is defined -- sort -V over the string with the leading b
+# removed. A second opinion about which release is newer would be worse than
+# no opinion.
+sw_newer() {
+    local a="${1#b}" b="${2#b}"
+    [ -n "$a" ] && [ -n "$b" ] || { echo 0; return; }
+    [ "$a" = "$b" ] && { echo 0; return; }
+    if [ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -1)" = "$b" ]; then
+        echo 1
+    else
+        echo 0
+    fi
+}
+
+# Carry the running software onto the new slot when it is newer than the one
+# the OS payload brings.
+#
+# An OS update replaces a whole root filesystem, so it carries whatever
+# software was baked into that image -- and an image is built once and then
+# sits. os 1.3 bundles b1.13.25; a client on b1.13.33 taking that update lost
+# eight releases and got them back only by updating again afterwards. The admin
+# page warned about it, which is better than silence and worse than it not
+# happening.
+#
+# Only forwards, and only when the OS is not going backwards. On a rollback the
+# payload's own software is the right answer: it is what that OS shipped with
+# and was tested against, and newer software may need a newer OS -- which is
+# precisely what requires_os exists to say.
+carry_software_forward() {
+    local mnt="$1" newos="$2"
+    local cursw newsw curos rootdev name dest mode carried=0 skipped=0 failed=0
+
+    cursw=$(installed_software)
+    newsw=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' "$mnt/usr/local/bin/kiosk.py" \
+            2>/dev/null | head -1)
+    [ -n "$newsw" ] || newsw=$(cat "$mnt/etc/steadyscreen-software-version" \
+                               2>/dev/null | tr -d ' \t\n')
+    curos=$(installed_os)
+
+    [ -n "$cursw" ] && [ "$cursw" != unknown ] || return 0
+    if [ "$(os_cmp "$newos" "$curos")" = -1 ]; then
+        note "software  : keeping $newsw (this OS is older; its own software is
+       what it was tested with)"
+        return 0
+    fi
+    if [ "$(sw_newer "$cursw" "$newsw")" != 1 ]; then
+        note "software  : $newsw from the image (not older than the $cursw here)"
+        return 0
+    fi
+
+    # Read the table BEFORE deciding there is work to do, and say so if it is
+    # empty.
+    #
+    # `command -v` only proved the file existed. On a slot whose kiosk-deploy
+    # predates `list` it exists, prints its usage to stderr, and returns
+    # nothing -- so the loop below ran zero times, carried nothing, and printed
+    # nothing at all. The update then quietly did the exact thing this function
+    # was written to prevent. A guard that cannot tell "nothing to do" from "I
+    # could not find out" is not a guard.
+    local table
+    table=$(/usr/local/sbin/kiosk-deploy list 2>/dev/null)
+    if [ -z "$table" ]; then
+        note "software  : this system's kiosk-deploy cannot list the component
+       table, so nothing can be carried; leaving $newsw from the image"
+        return 0
+    fi
+
+    rootdev=$(findmnt -no SOURCE / 2>/dev/null)
+    while read -r name dest mode; do
+        [ -n "$dest" ] || continue
+        [ -f "$dest" ] || continue
+        # Anything not on the root filesystem is on /data, which BOTH slots
+        # share -- copying it into the new slot would write into an empty
+        # directory that the bind mount hides at boot. It is already correct
+        # over there because it is the same file.
+        if [ "$(findmnt -no SOURCE -T "$dest" 2>/dev/null)" != "$rootdev" ]; then
+            skipped=$((skipped + 1)); continue
+        fi
+        mkdir -p "$(dirname "$mnt$dest")" 2>/dev/null || true
+        if install -m "$mode" "$dest" "$mnt$dest" 2>/dev/null; then
+            carried=$((carried + 1))
+        else
+            note "  could not carry $name"
+            failed=$((failed + 1))
+        fi
+    done <<EOF
+$table
+EOF
+
+    # Stamped only if the WHOLE set went across.
+    #
+    # `carried > 0` meant one file out of twenty-seven stamped the slot as the
+    # full release -- and the per-file failures print to a stdout that nobody
+    # reads, because this runs inside an apply that the admin page started and
+    # that ends in reboot. A slot carrying twenty of twenty-seven files would
+    # have called itself b1.13.35 in the slot table.
+    local expected=$(( carried + skipped + failed ))
+    local total; total=$(printf '%s\n' "$table" | grep -c .)
+    if [ "$carried" -gt 0 ] && [ "$failed" = 0 ] && [ "$expected" = "$total" ]; then
+        printf '%s\n' "$cursw" > "$mnt/etc/steadyscreen-software-version" \
+            2>/dev/null || true
+        note "software  : carried $cursw forward ($carried files), instead of the
+       $newsw this image brings"
+    elif [ "$carried" -gt 0 ]; then
+        note "software  : WARNING carried only $carried of $total files; leaving
+       the version marker at $newsw so nothing claims a release it does not
+       have. The new slot is a mixture -- update it once it is running."
+    fi
+    return 0
+}
+
+cmd_status() {
+    local run com try
+    run=$(running_slot) || die "this system does not boot from a labelled slot;
+       it predates A/B and cannot take an OS update. Reinstall from a current
+       image."
+    com=$(committed_slot); try=$(pending_try)
+    echo "running   : slot $run  ($(slot_dev "$run"))"
+    echo "committed : slot ${com:-<unset>}"
+    echo "pending   : ${try:-none}"
+    echo "os        : $(installed_os)"
+    echo "software  : $(installed_software)"
+    # Both slots, always, and named so the admin page can pick them apart
+    # without the reader losing a line they can understand in a terminal.
+    echo "slot a    : $(slot_contents a)"
+    echo "slot b    : $(slot_contents b)"
+    # Whether a download is sitting here waiting for somebody to say yes.
+    #
+    # The decision point after a download lives in a browser, and browsers get
+    # closed. Without this the payload would stay on disk with nothing able to
+    # find it: 690 MB occupying /var/tmp, and an operator who would have to
+    # download it all again to get back to the question they were asked.
+    if [ -f "$STAGED/verified" ] && [ -f "$STAGED/rootfs.squashfs" ]; then
+        echo "staged    : $(manifest_field "$STAGED/os.json" version) (downloaded, waiting to be installed)"
+    elif [ -d "$STAGED" ] && lock_held; then
+        echo "staged    : downloading now"
+    elif [ -d "$STAGED" ]; then
+        echo "staged    : incomplete (a download did not finish)"
+    else
+        echo "staged    : none"
+    fi
+    [ "$run" != "${com:-}" ] && [ -n "${com:-}" ] && \
+        echo "NOTE      : running an uncommitted slot; a reboot would return to $com"
+    return 0
+}
+
+cmd_check() {
+    local tmp ver have sw newer
+    WORK=$(mktemp -d -p "$STAGE"); tmp="$WORK"
+    fetch_os_manifest "$tmp"
+    ver=$(normalise_os "$(manifest_field "$tmp/os.json" version)")
+    sw=$(manifest_field "$tmp/os.json" software)
+    have=$(installed_os)
+    newer=$([ "$(os_cmp "$ver" "$have")" = 1 ] && echo true || echo false)
+    OSU_AVAIL="$ver" OSU_HAVE="$have" OSU_SW="$sw" OSU_NEW="$newer" \
+    OSU_SWNOW="$(installed_software)" OSU_RUN="$(running_slot || echo '')" \
+    OSU_COM="$(committed_slot)" OSU_CH="$(cfg channel stable)" \
+    OSU_ARM="$([ -d "$ESP_GRUB" ] && [ -w "$ESP_GRUB" ] && echo yes || echo no)" \
+    python3 -c "
+import json, os
+print(json.dumps({
+    'os_installed':       os.environ['OSU_HAVE'].strip(),
+    'os_available':       os.environ['OSU_AVAIL'].strip(),
+    'update_available':   os.environ['OSU_NEW'].strip() == 'true',
+    'bundles_software':   os.environ['OSU_SW'].strip(),
+    'software_installed': os.environ['OSU_SWNOW'].strip(),
+    'running_slot':       os.environ['OSU_RUN'].strip(),
+    'committed_slot':     os.environ['OSU_COM'].strip(),
+    'channel':            os.environ['OSU_CH'].strip(),
+    # Whether this machine can actually select a slot. False means an update
+    # would write one and then be unable to boot it, so the page can say that
+    # instead of offering a button that spends ten minutes finding out.
+    'can_arm':            os.environ['OSU_ARM'].strip() == 'yes',
+}, indent=2))"
+}
+
+# --- staging -------------------------------------------------------------
+#
+# The payload lives at a FIXED path between the two halves of an update, not in
+# a mktemp directory: downloading and installing are now separate commands so
+# that a person can be asked, after 690 MB has landed and before anything is
+# written, whether they still want to go ahead. A temp directory cleaned by the
+# EXIT trap could not survive the gap.
+STAGED="${OSUPDATE_STAGED:-$STAGE/kiosk-osupdate-staged}"
+
+# Set by `cancel` and read by the download loop. On /run so it cannot survive a
+# reboot and silently cancel a later download.
+CANCEL=/run/kiosk/osupdate-cancel
+
+# Where the new slot is mounted while it is written.
+#
+# NOT inside $STAGED. It used to be "$STAGED/slot", and both `cancel` and
+# `download` do an unconditional `rm -rf "$STAGED"` with no --one-file-system --
+# so either of them, run while an install was between mount and umount, would
+# have descended into the mounted slot and emptied the filesystem that had just
+# been written. A/B would have saved the machine, but the spare slot would be
+# gone and a store display would sit dark until somebody power-cycled it. Two
+# browser tabs was enough to reach it: /api/osupdate takes all three actions and
+# the shipped default has no admin password.
+SLOTMNT=/run/kiosk/slot
+
+# One OS operation at a time.
+#
+# There was no lock anywhere -- not here, not in kiosk-update, not in kiosk.py.
+# Concurrent download and install is the case that corrupts a slot; concurrent
+# downloads merely waste 690 MB twice into the same directory, which is its own
+# kind of wrong.
+LOCK=/run/kiosk/osupdate.lock
+take_lock() {
+    mkdir -p "$(dirname "$LOCK")" 2>/dev/null || true
+    # Braces. `exec 9>"$LOCK" 2>/dev/null` puts the 2>/dev/null on the SHELL,
+    # permanently, because an exec with no command changes the shell's own
+    # redirections -- so every die() and every warning after this point went
+    # silently to /dev/null. Both refusals below returned 1 and printed
+    # nothing. Same shape as the redirect bug in phase(), found the same way:
+    # by running it and noticing a message that should have been there.
+    { exec 9>"$LOCK"; } 2>/dev/null || return 1
+    flock -n 9 2>/dev/null || return 1
+    return 0
+}
+lock_held() {
+    # Read-only probe: can somebody else's lock be taken? If not, one is held.
+    #
+    # A file that does not exist is not a lock somebody is holding. This used to
+    # collapse those two cases: after a reboot /run is empty, so opening the
+    # lock failed, and the failure was read as "held" -- `status` then reported
+    # "downloading now" on a machine doing nothing at all, which is the sort of
+    # lie that sends somebody looking for a download to cancel. Seen on
+    # 10.10.9.178 straight after its first reboot.
+    [ -e "$LOCK" ] || return 1
+    ( exec 8>"$LOCK" 2>/dev/null && flock -n 8 2>/dev/null ) && return 1 || return 0
+}
+
+# The checks that decide whether this machine can take an OS update at all.
+# Run by download and by install, because either can be the first thing called.
+slot_preflight() {
+    RUN=$(running_slot) || die "this system does not boot from a labelled slot;
+       it predates A/B and cannot take an OS update."
+    TARGET=$(other_slot "$RUN")
+    DEV=$(slot_dev "$TARGET")
+    [ -b "$DEV" ] || die "slot $TARGET has no device (looked for label ds-root-$TARGET)"
+    [ "$DEV" != "$(findmnt -no SOURCE /)" ] || die "refusing: that is the running slot"
+
+    # The boot arbiter has to exist BEFORE anything is written.
+    #
+    # Checked here because it used to be checked at the very end, by
+    # grub-editenv failing. On 10.10.9.178 on 2026-08-31 that meant formatting
+    # slot b, unpacking 690 MB into it and carrying 25 files forward -- minutes
+    # of work -- and only then reporting "cannot open grubenv.new". The slot was
+    # written and could not be selected: everything done, nothing achieved.
+    #
+    # Having A/B PARTITIONS is not the same as booting through the arbiter, and
+    # that machine is the proof: its partitions are labelled ds-root-a/b, so
+    # running_slot answered "slot a" quite happily, while its kernel line said
+    # root=UUID=... and its only NVRAM entry was a leftover Android-IA. Nothing
+    # on the disk was wrong. The thing that was missing was on the ESP.
+    if [ ! -d "$ESP_GRUB" ] || [ ! -w "$ESP_GRUB" ]; then
+        die "this display boots without the A/B arbiter, so a new slot could be
+       written but never selected. Nothing has been changed.
+
+       Its partitions are labelled ds-root-a/b, but $ESP_GRUB is missing --
+       it boots its root directly instead of choosing a slot. Run
+
+           sudo kiosk-migrate-boot
+
+       to move it onto the arbiter, then take the OS update."
+    fi
+}
+
+cmd_cancel() {
+    [ "$(id -u)" = 0 ] || die "must run as root"
+
+    # This used to print "nothing has been written to any slot" unconditionally,
+    # having checked nothing. Run after a successful install it said exactly
+    # that while ds_try was armed and the next boot was the new system: a guard
+    # reporting what a working guard reports.
+    local try; try=$(pending_try)
+    if [ -n "$try" ]; then
+        die "too late to cancel: slot $try is already written and armed, and the
+       display will start into it. To undo that, install the previous OS or
+       let the slot fail and fall back on its own."
+    fi
+
+    mkdir -p "$(dirname "$CANCEL")" 2>/dev/null || true
+    : > "$CANCEL" 2>/dev/null || true
+
+    # If an operation holds the lock it is a download, and it cleans up after
+    # itself when it sees the flag -- removing $STAGED from here would be
+    # deleting a directory another process is writing into, and (until the
+    # mountpoint moved) could have descended into a mounted slot.
+    if lock_held; then
+        echo "asked the running download to stop; it will discard what arrived."
+        return 0
+    fi
+
+    take_lock || die "could not take the update lock; try again in a moment."
+    rm -rf "$STAGED"
+    rm -f "$CANCEL"
+    progress ""
+    echo "cancelled; nothing has been written to any slot."
+}
+
+cmd_download() {
+    [ "$(id -u)" = 0 ] || die "must run as root"
+    take_lock || die "another OS update operation is already running on this
+       display. Nothing has been changed."
+    slot_preflight
+
+    local ver url sum need avail seen dlpid got
+    rm -f "$CANCEL"
+    rm -rf "$STAGED"; mkdir -p "$STAGED"
+
+    fetch_os_manifest "$STAGED"
+    ver=$(manifest_field "$STAGED/os.json" version)
+    url=$(manifest_field "$STAGED/os.json" url)
+    sum=$(manifest_field "$STAGED/os.json" sha256)
+    [ -n "$ver" ] && [ -n "$url" ] && [ -n "$sum" ] \
+        || die "OS manifest is missing version, url or sha256"
+    [ "$ver" != "$(installed_os)" ] || note "already on $ver; reinstalling it"
+
+    note "target    : slot $TARGET ($DEV)"
+    note "version   : $ver"
+
+    # Space check before the download, not after: filling the data partition
+    # and *then* discovering it is a miserable way to find out.
+    need=$(manifest_field "$STAGED/os.json" size); need=${need:-0}
+    avail=$(df -B1 --output=avail "$STAGED" 2>/dev/null | tail -1)
+    [ -n "$avail" ] || note "WARNING: cannot measure free space where the payload will go"
+    if [ -n "$avail" ] && [ "$need" -gt 0 ] && [ "$avail" -lt "$((need + 200*1024*1024))" ]; then
+        rm -rf "$STAGED"
+        die "not enough room to stage the image: need about $((need/1048576)) MB
+       plus headroom, have $((avail/1048576)) MB free."
+    fi
+
+    # Downloaded in the background so the size of the partial file can be
+    # reported while it grows, and so the loop can watch for a cancel. 690 MB
+    # over a slow link is minutes of a modal that would otherwise say only
+    # "downloading", which is indistinguishable from a stall.
+    #
+    # Measured from the file rather than parsed out of curl's own meter: the
+    # meter is drawn for a terminal, changes shape between curl versions, and
+    # would have to be scraped off stderr, which is where the failure reason
+    # has to travel.
+    phase "downloading"
+    curl -fsSL --max-time 3600 -o "$STAGED/rootfs.squashfs" "$url" &
+    dlpid=$!
+    seen=0
+    while kill -0 "$dlpid" 2>/dev/null; do
+        # Cancelling is only ever possible here. Past this point the slot is
+        # being written, and stopping half way through writing a filesystem is
+        # how you get a slot that neither boots nor announces that it will not.
+        if [ -e "$CANCEL" ]; then
+            kill "$dlpid" 2>/dev/null
+            wait "$dlpid" 2>/dev/null
+            rm -rf "$STAGED"; rm -f "$CANCEL"
+            progress ""
+            note "download cancelled; nothing was written"
+            return 10
+        fi
+        seen=$(stat -c%s "$STAGED/rootfs.squashfs" 2>/dev/null || echo 0)
+        progress "downloading $seen $need"
+        sleep 2
+    done
+    # `wait` on a known pid returns ITS status. Without this the download could
+    # fail and the script would carry on to checksum a truncated file -- which
+    # would be caught, but reported as a checksum mismatch, sending whoever
+    # read it looking for a corrupted release instead of a dropped connection.
+    wait "$dlpid" || { rm -rf "$STAGED"; die "download failed: $url"; }
+    progress "downloading $need $need"
+
+    phase "verifying"
+    got=$(sha256sum "$STAGED/rootfs.squashfs" | cut -d" " -f1)
+    if [ "$got" != "$sum" ]; then
+        rm -rf "$STAGED"
+        die "checksum mismatch -- refusing to install.
+       expected $sum
+       got      $got"
+    fi
+    # Written only now, after the sha256 has passed.
+    #
+    # `status` used to report "downloaded, waiting to be installed" from the
+    # existence of rootfs.squashfs -- which curl creates with its first byte. So
+    # during a download the card said the payload was "already downloaded and
+    # verified on this display", of a file that was a tenth arrived. Pressing
+    # Install then died with "no longer matches its manifest", which reads as a
+    # corrupt release when the file was merely half there.
+    printf '%s\n' "$ver" > "$STAGED/verified" 2>/dev/null || true
+    # Nothing is running any more, so nothing should be reported as running.
+    # The file is on a tmpfs, which stops it outliving a REBOOT; it did not stop
+    # it outliving its own run, and the page paints whatever it finds.
+    progress ""
+    note "staged    : $ver, verified, nothing written yet"
+    return 0
+}
+
+cmd_install() {
+    [ "$(id -u)" = 0 ] || die "must run as root"
+    take_lock || die "another OS update operation is already running on this
+       display. Nothing has been changed."
+    slot_preflight
+
+    local run target dev tmp ver sum got reboot=0
+    for a in "$@"; do [ "$a" = --reboot ] && reboot=1; done
+    run="$RUN"; target="$TARGET"; dev="$DEV"; tmp="$STAGED"
+
+    [ -f "$STAGED/rootfs.squashfs" ] && [ -f "$STAGED/os.json" ] \
+        || die "nothing staged -- run `basename "$0"` download first"
+    [ -f "$STAGED/verified" ] \
+        || die "the staged payload never finished downloading. Run download
+       again; nothing has been changed."
+
+    # Verified AGAIN, both the signature and the payload, on the way in.
+    #
+    # The staged copy sat on disk between two commands, which is a gap another
+    # process could have written into. Re-checking costs seconds against 690 MB
+    # and removes the question entirely -- and this is the last point at which
+    # refusing is free, because the next thing that happens is mkfs.
+    [ -f "$STAGED/os.json.sig" ] || die "staged manifest has no signature"
+    ssh-keygen -Y verify -f "$SIGNERS" -I "$PRINCIPAL" -n "$NS" \
+        -s "$STAGED/os.json.sig" < "$STAGED/os.json" >/dev/null 2>&1 \
+        || die "the staged manifest no longer verifies -- refusing"
+    ver=$(manifest_field "$STAGED/os.json" version)
+    sum=$(manifest_field "$STAGED/os.json" sha256)
+    got=$(sha256sum "$STAGED/rootfs.squashfs" | cut -d" " -f1)
+    [ "$got" = "$sum" ] || die "the staged payload no longer matches its manifest"
+
+    note "installing: $ver into slot $target ($dev)"
+
+    # Everything below here writes to the inactive slot only.
+    local mnt="$SLOTMNT"
+    mkdir -p "$mnt"
+    umount "$mnt" 2>/dev/null || true
+    phase "formatting slot $target"
+    mkfs.ext4 -F -q -L "ds-root-$target" -m 1 "$dev" || die "mkfs failed on $dev"
+    mount "$dev" "$mnt" || die "cannot mount $dev"
+
+    phase "unpacking"
+    unsquashfs -f -d "$mnt" "$tmp/rootfs.squashfs" >/dev/null 2>&1 \
+        || { umount "$mnt"; die "unsquashfs failed"; }
+
+    # ------------------------------------------------------------------
+    # Everything below is what the INSTALLER does after unpacking this exact
+    # squashfs. The updater unpacks the same image onto a machine that is
+    # already somebody's, so anything the installer generates per-machine has
+    # to be carried across instead of generated -- and anything that only
+    # belongs in the live installer environment has to go.
+    #
+    # Skipping this was not theoretical. The first real OS update, on .169,
+    # booted to a black screen, changed the machine's ssh host key, and reset
+    # the kiosk account to the live image's password. A/B rollback covered it,
+    # which is exactly what it is for.
+    # ------------------------------------------------------------------
+
+    # 1. The installer service must NOT survive onto a running system. Its
+    #    Conflicts=getty@tty1.service is evaluated when the job is queued,
+    #    BEFORE ConditionKernelCommandLine= is tested, so merely being enabled
+    #    stops the autologin getty -- X never starts and the screen stays dark
+    #    with the machine otherwise healthy. kiosk-install has removed this
+    #    since the day it was found; this path was written later and did not.
+    # An OS update replaces the whole slot. Snapshot /data first: it is what
+    # survives, and it is what somebody would want back if the new slot is
+    # wrong. Never fatal.
+    if [ -x /usr/local/sbin/kiosk-snapshot ]; then
+        /usr/local/sbin/kiosk-snapshot create "before-os-$ver" >/dev/null 2>&1 \
+            || echo "    (could not snapshot first; continuing)" >&2
+    fi
+
+    rm -f "$mnt/etc/systemd/system/multi-user.target.wants/kiosk-installer.service"
+    rm -f "$mnt/etc/systemd/system/kiosk-installer.service"
+    rm -f "$mnt/usr/local/sbin/kiosk-install"
+
+    # 2. Identity that must not change because the OS did. All of it lives on
+    #    the slot, so unpacking replaces it with whatever the image carries.
+    #
+    #    /etc/shadow is the serious one: the live image ships kiosk:kiosk on
+    #    purpose, because whoever holds the installer stick has physical access
+    #    anyway. Carrying that onto a client -- which has password ssh enabled
+    #    -- would hand the account to anyone who has read the build scripts.
+    local f
+    for f in /etc/shadow /etc/gshadow /etc/passwd /etc/group /etc/machine-id; do
+        [ -f "$f" ] && cp -a "$f" "$mnt$f" 2>/dev/null
+    done
+
+    #    ssh host keys, or every OS update looks like a man-in-the-middle to
+    #    anyone who has connected before -- and teaches them to click through
+    #    the warning, which is the part that actually costs something. Prefer
+    #    the copy kept on /data; fall back to the running slot's own.
+    if [ -n "$(ls -A /data/ssh 2>/dev/null)" ]; then
+        cp -a /data/ssh/. "$mnt/etc/ssh/" 2>/dev/null || true
+    else
+        cp -a /etc/ssh/ssh_host_* "$mnt/etc/ssh/" 2>/dev/null || true
+    fi
+    chmod 600 "$mnt"/etc/ssh/ssh_host_*_key 2>/dev/null || true
+    ls "$mnt"/etc/ssh/ssh_host_*_key >/dev/null 2>&1 \
+        || note "WARNING: the new slot has no ssh host keys; it will generate fresh ones"
+
+    #    Anything the client was told about itself that is not already on /data.
+    for f in /etc/hostname /etc/hosts /etc/timezone /etc/sudoers.d/kiosk; do
+        [ -e "$f" ] && cp -a "$f" "$mnt$f" 2>/dev/null
+    done
+    [ -e /etc/localtime ] && cp -a /etc/localtime "$mnt/etc/localtime" 2>/dev/null
+
+    # 3. The new slot must describe itself. Take the running fstab and swap only
+    # the root line: that keeps the ESP and data UUIDs and every bind mount
+    # exactly as the installer wrote them, instead of reinventing them here and
+    # getting one subtly wrong.
+    if [ -f /etc/fstab ]; then
+        sed "s|^LABEL=ds-root-[ab][[:space:]]|LABEL=ds-root-$target  |" \
+            /etc/fstab > "$mnt/etc/fstab"
+    fi
+
+    # Stable kernel names, so the ESP config never has to know a version.
+    local kver
+    kver=$(basename "$(ls -1 "$mnt"/boot/vmlinuz-* 2>/dev/null | head -1)" \
+           2>/dev/null | sed 's/^vmlinuz-//')
+    if [ -n "$kver" ]; then
+        ln -sf "vmlinuz-$kver"    "$mnt/boot/vmlinuz"
+        ln -sf "initrd.img-$kver" "$mnt/boot/initrd.img"
+    fi
+    echo "$ver" > "$mnt$OS_VERSION_FILE" 2>/dev/null || true
+    # An OS update is a bundle: it replaces the whole slot, so it brings the
+    # software baked into that rootfs whether anyone meant it to or not. The
+    # slot already carries its own marker from build-rootfs; leave it alone and
+    # say what it is, rather than claiming the OS version is the software one.
+    note "bundles   : software $(cat "$mnt/etc/steadyscreen-software-version" 2>/dev/null || echo unknown)"
+    grep -q . "$mnt$OS_VERSION_FILE" 2>/dev/null \
+        || note "WARNING: could not stamp the version into the new slot"
+
+    # And keep them true. Debian's kernel hooks maintain /vmlinuz at the root,
+    # not /boot/vmlinuz, so a slot without this loses its boot symlink at the
+    # first kernel upgrade and stops at a GRUB "file not found".
+    if ! grep -qs '^[[:space:]]*link_in_boot[[:space:]]*=[[:space:]]*yes' \
+            "$mnt/etc/kernel-img.conf"; then
+        printf 'link_in_boot = yes\ndo_symlinks = yes\n' >> "$mnt/etc/kernel-img.conf"
+    fi
+
+    # Refuse to arm a slot that cannot boot, or that would boot to a black
+    # screen. Rollback would save the machine anyway, but an update that is
+    # *known* to fail should not be attempted: it costs a reboot and hands the
+    # operator a mystery. Each of these has actually happened.
+    [ -e "$mnt/boot/vmlinuz" ] && [ -e "$mnt/boot/initrd.img" ] \
+        || { umount "$mnt"; die "the unpacked slot has no kernel -- not arming it"; }
+    [ ! -e "$mnt/etc/systemd/system/kiosk-installer.service" ] \
+        || { umount "$mnt"; die "the installer service survived into the new slot;
+       its Conflicts=getty@tty1 would leave a black screen -- not arming it"; }
+    grep -q '^kiosk:' "$mnt/etc/shadow" 2>/dev/null \
+        || note "WARNING: the new slot has no kiosk account entry"
+
+    carry_software_forward "$mnt" "$ver"
+
+    # Checked, not hoped. An unmount that quietly fails here is followed by
+    # arming a slot whose writes may still be in the page cache, and then by a
+    # reboot -- and the next thing to touch that directory is an rm -rf.
+    sync
+    umount "$mnt" || die "could not unmount the new slot after writing it.
+       The slot has NOT been armed, so this display still starts the system it
+       is running. Reboot it and try again."
+
+    phase "arming slot $target for one attempt"
+    grub-editenv "$GRUBENV" set ds_try="$target" \
+        || die "could not arm the boot attempt; the slot is written but not selected"
+    mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
+    printf '{"staged":"%s","slot":"%s","at":"%s"}\n' "$ver" "$target" "$(date -Is)" \
+        > "$STATE" 2>/dev/null || true
+
+    # The payload has served its purpose and is most of a gigabyte. Removed
+    # only now, after the slot is armed: had it gone earlier, a failure between
+    # unpacking and arming would have meant downloading it all again.
+    rm -rf "$STAGED"
+    rmdir "$SLOTMNT" 2>/dev/null || true
+
+    echo "slot $target holds $ver and will be tried at the next boot."
+    echo "If it does not come up, the next boot returns to slot $run by itself."
+    if [ "$reboot" = 1 ]; then
+        phase "rebooting"
+        sleep 2; reboot
+    fi
+
+}
+
+cmd_apply() {
+    # The CLI keeps doing both halves in one command. Splitting them is for the
+    # admin page, which has to be able to ask a person whether to go on; a
+    # terminal already has a person, and they typed the command.
+    cmd_download || return $?
+    cmd_install "$@"
+}
+
+cmd_commit() {
+    [ "$(id -u)" = 0 ] || die "must run as root"
+    local run com
+    run=$(running_slot) || die "not running from a labelled slot"
+    com=$(committed_slot)
+    if [ "$run" = "$com" ]; then
+        echo "already committed to slot $run"
+        return 0
+    fi
+    grub-editenv "$GRUBENV" set ds_slot="$run" || die "could not commit slot $run"
+    grub-editenv "$GRUBENV" unset ds_try 2>/dev/null || true
+    echo "committed slot $run (was $com)"
+}
+
+case "${1:-status}" in
+    status) cmd_status ;;
+    check)  cmd_check ;;
+    apply)    shift; cmd_apply "$@" ;;
+    download) cmd_download ;;
+    install)  shift; cmd_install "$@" ;;
+    cancel)   cmd_cancel ;;
+    commit) cmd_commit ;;
+    *) echo "usage: kiosk-osupdate {status|check|apply [--reboot]|commit}" >&2
+       exit 1 ;;
+esac

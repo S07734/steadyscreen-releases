@@ -1,0 +1,137 @@
+#!/bin/bash
+# Read-only diagnostics, runnable through sudo without a password.
+#
+#   kiosk-diag fs | boot | disk | net | power | update | log | all
+#
+# Every command below is READ-ONLY and fixed. Nothing the caller supplies ever
+# reaches a shell: the section name is matched against a case list and the
+# commands are literals. That is what makes it safe to grant through sudoers,
+# the same reasoning as kiosk-deploy's fixed component table.
+#
+# It exists because the questions that actually get asked in the field --
+# "did this filesystem get repaired after the power went?", "is there a stale
+# boot entry?" -- could not be answered as the kiosk user at all, and root was
+# not available remotely. Diagnosing a fleet you cannot log into requires the
+# answers to be reachable.
+#
+# Deliberately prints no secrets: no wifi keys, no passwords, no private keys.
+set -uo pipefail
+
+hdr() { printf '\n===== %s =====\n' "$1"; }
+rootdev() { findmnt -no SOURCE / 2>/dev/null; }
+rootdisk() { lsblk -no PKNAME "$(rootdev)" 2>/dev/null | head -1; }
+
+sec_fs() {
+    hdr "filesystems"
+    # One at a time: findmnt given several targets fails wholesale if any one
+    # is absent, which blanked the whole section on a machine without /data.
+    local m
+    for m in / /data /boot/efi /var/log/journal; do
+        findmnt -no SOURCE,TARGET,FSTYPE,OPTIONS "$m" 2>/dev/null || echo "  $m  not mounted"
+    done
+    hdr "filesystem health (state, mounts since last check)"
+    local d
+    for d in $(lsblk -lno NAME,FSTYPE "/dev/$(rootdisk)" 2>/dev/null \
+               | awk '$2=="ext4"{print $1}'); do
+        echo "--- /dev/$d"
+        dumpe2fs -h "/dev/$d" 2>/dev/null | grep -E \
+          "Filesystem volume name|Filesystem state|Mount count|Maximum mount|Last checked|Lifetime writes|Free blocks"
+    done
+    hdr "space"
+    df -h / /data /boot/efi 2>/dev/null
+}
+
+# The firmware's own answer, read straight out of the EFI variable.
+#
+# The first four bytes of an efivar are its attributes; the fifth is the value.
+# mokutil would say the same thing and is not installed on this image.
+secure_boot_state() {
+    local f v
+    f=$(ls /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | head -1)
+    [ -n "$f" ] || { echo "not reported (no SecureBoot variable)"; return; }
+    v=$(od -An -t u1 -j 4 -N 1 "$f" 2>/dev/null | tr -d ' \n')
+    case "$v" in
+        1) echo "ENABLED" ;;
+        0) echo "off" ;;
+        *) echo "not reported (unreadable)" ;;
+    esac
+}
+
+sec_boot() {
+    hdr "firmware"
+    if [ -d /sys/firmware/efi ]; then
+        echo "UEFI $(cat /sys/firmware/efi/fw_platform_size 2>/dev/null)-bit"
+        # Secure Boot is a supported mode since 2026-09-03, so a display has
+        # to be able to say whether it is in it. The EFI variable is the
+        # firmware's own answer; the lockdown file is the kernel's, and the
+        # two agreeing is what "on" actually means.
+        echo "Secure Boot: $(secure_boot_state)"
+        [ -r /sys/kernel/security/lockdown ] \
+            && echo "kernel lockdown: $(cat /sys/kernel/security/lockdown)"
+        hdr "NVRAM boot entries"
+        efibootmgr -v 2>/dev/null || echo "efibootmgr unavailable"
+    else
+        echo "legacy BIOS (no efivars)"
+    fi
+    hdr "kernel command line"
+    cat /proc/cmdline
+}
+
+sec_disk() {
+    hdr "block devices"
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT
+    hdr "partition table of the system disk"
+    sgdisk -p "/dev/$(rootdisk)" 2>/dev/null | head -20
+}
+
+sec_net() {
+    hdr "interfaces"
+    ip -br addr 2>/dev/null
+    hdr "connectivity"
+    nmcli -t -f STATE,CONNECTIVITY general 2>/dev/null
+    hdr "saved networks (names only -- keys are never printed)"
+    nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep wireless || echo "none"
+    hdr "wifi in range"
+    nmcli -t -f SSID,SIGNAL,SECURITY device wifi list 2>/dev/null | head -12
+}
+
+sec_power() {
+    hdr "uptime"
+    uptime -p; echo "booted: $(uptime -s 2>/dev/null)"
+    hdr "recent boots (a gap without a clean shutdown means the power went)"
+    journalctl --list-boots --no-pager 2>/dev/null | tail -10
+    hdr "unclean shutdowns recorded this boot"
+    journalctl -b --no-pager 2>/dev/null \
+      | grep -icE "ext4-fs .*(recovery|error)|unclean|dirty" \
+      | sed 's/^/matching log lines: /'
+}
+
+sec_update() {
+    hdr "installed version"
+    sed -n 's/^VERSION = "\(.*\)"/\1/p' /usr/local/bin/kiosk.py 2>/dev/null | head -1
+    hdr "update state"
+    cat /var/lib/kiosk/update-state.json 2>/dev/null || echo "no update has run"
+    hdr "update config"
+    cat /etc/kiosk/update.json 2>/dev/null
+    hdr "timer"
+    systemctl list-timers kiosk-update.timer --no-pager 2>/dev/null | head -3
+}
+
+sec_log() {
+    hdr "last 60 lines of this boot"
+    journalctl -b -n 60 --no-pager 2>/dev/null
+    hdr "client stderr"
+    tail -n 40 /home/kiosk/.xsession-errors 2>/dev/null
+}
+
+case "${1:-all}" in
+    fs)     sec_fs ;;
+    boot)   sec_boot ;;
+    disk)   sec_disk ;;
+    net)    sec_net ;;
+    power)  sec_power ;;
+    update) sec_update ;;
+    log)    sec_log ;;
+    all)    sec_fs; sec_boot; sec_disk; sec_net; sec_power; sec_update ;;
+    *) echo "usage: kiosk-diag {fs|boot|disk|net|power|update|log|all}" >&2; exit 1 ;;
+esac

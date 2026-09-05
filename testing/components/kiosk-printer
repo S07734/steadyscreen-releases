@@ -1,0 +1,1418 @@
+#!/bin/sh
+# Receipt-printer plumbing for the display client.
+#
+#   kiosk-printer list                 queues CUPS knows about
+#   kiosk-printer detect               USB/network printers CUPS can see
+#   kiosk-printer add NAME URI [PPD]   add a queue (raw if no PPD given)
+#   kiosk-printer add-thermal [NAME] [URI]   add a queue on our ESC/POS bridge
+#   kiosk-printer add-ipp NAME URI     add a driverless IPP/AirPrint queue
+#   kiosk-printer add-shared NAME URI  use a printer shared by another display
+#   kiosk-printer default NAME
+#   kiosk-printer test [NAME]
+#   kiosk-printer width [DOTS]         printable width; no argument prints it
+#   kiosk-printer ruler [NAME]         print a dot ruler to measure that width
+#   kiosk-printer reset [NAME]         clear a wedged thermal printer
+#   kiosk-printer proto NAME star|escpos  which language a queue speaks
+#   kiosk-printer unwedge [NAME]       clear jobs stuck behind a failure
+#   kiosk-printer persist              move /etc/cups onto /data so it survives
+#   kiosk-printer migrate-thermal      move queues off the GPL-3 TM-T88V driver
+#   kiosk-printer enable|disable       run cupsd on this display, or do not
+#   kiosk-printer share on|off NAME    let other displays print to this queue
+#   kiosk-printer share state          which queues are shared
+#   kiosk-printer state                enabled/disabled, for the admin page
+#
+# Our own bridge (`rastertoescpos` + steadyscreen-escpos.ppd) is what every
+# queue is built on: one filter for every ESC/POS thermal printer rather than a
+# driver per model.
+#
+# The GPL-3 TM-T88V driver it replaced is GONE as of b1.13.8 -- removed from
+# the image and deleted from clients by `retire-tmt88v`. `migrate-thermal`
+# stays, and must: it moves a queue off that driver, and a client that has
+# been offline long enough could still have one.
+set -eu
+[ "$(id -u)" = 0 ] || { echo "must run as root" >&2; exit 1; }
+have() { command -v "$1" >/dev/null; }
+have lpstat || { echo "cups-client not installed" >&2; exit 1; }
+die() { echo "$*" >&2; exit 1; }
+
+ESCPOS_PPD=/usr/share/cups/model/steadyscreen-escpos.ppd
+
+# Printable width in dots, on /data via the /etc/kiosk bind mount.
+#
+# PER QUEUE, with a client-wide default behind it. It used to be one number
+# per client, which was fine while a display had one printer -- and wrong the
+# moment .63 had two. The TM-T88V there is set to 64 mm and prints 512 dots;
+# the TP200 beside it takes more. One number cannot be right for both, and the
+# one that loses prints short without saying so.
+#
+#   {"width_dots": 576,
+#    "queues": {"Thermal": {"width_dots": 512}}}
+#
+# The filter reads the same file and picks the entry for $PRINTER, which cupsd
+# sets to the queue name for every filter it runs.
+PRINTER_CFG=/etc/kiosk/printer.json
+# 512, not 576.
+#
+# 576 is the arithmetic answer for 80 mm paper and it was wrong for both
+# printers actually in use -- the TM-T88V and the TP200 are each 512, found by
+# printing rulers and looking at them. So the default is now the value that has
+# been proven on hardware rather than the one derived from the paper size.
+#
+# It is also the safer of the two to be wrong about. Too narrow wastes a few
+# millimetres of paper and stays readable; too wide silently crops the right
+# hand side of every receipt, which is the kind of fault a shop finds weeks
+# later on a total nobody could read.
+DEFAULT_DOTS=512
+
+# Effective width for a queue: its own setting, else the client default, else
+# 576. Called with no queue name it gives the client default.
+width_dots() {
+    python3 - "$PRINTER_CFG" "$DEFAULT_DOTS" "${1:-}" <<'PYW' 2>/dev/null || echo "$DEFAULT_DOTS"
+import json, sys
+path, dflt, queue = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+def ok(v):
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return None
+    return v if 128 <= v <= 1024 else None
+try:
+    cfg = json.load(open(path))
+    if not isinstance(cfg, dict):
+        cfg = {}
+except Exception:
+    cfg = {}
+val = None
+if queue:
+    val = ok((cfg.get("queues") or {}).get(queue, {}).get("width_dots"))
+if val is None:
+    val = ok(cfg.get("width_dots"))
+print(val if val is not None else dflt)
+PYW
+}
+
+# Set the width for one queue, or for the client when queue is empty.
+set_width_dots() {
+    python3 - "$PRINTER_CFG" "$2" "$1" <<'PYW'
+import json, os, sys, tempfile
+path, val, queue = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+try:
+    cfg = json.load(open(path))
+    if not isinstance(cfg, dict):
+        cfg = {}
+except Exception:
+    cfg = {}
+if queue:
+    cfg.setdefault("queues", {}).setdefault(queue, {})["width_dots"] = val
+else:
+    cfg["width_dots"] = val
+d = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(dir=d)
+with os.fdopen(fd, "w") as fh:
+    json.dump(cfg, fh, indent=2)
+    fh.write("\n")
+os.chmod(tmp, 0o644)
+os.replace(tmp, path)
+PYW
+}
+
+# Forget a queue's width when the queue goes, so a name reused later does not
+# silently inherit the last printer's setting.
+forget_width_dots() {
+    python3 - "$PRINTER_CFG" "$1" <<'PYW' 2>/dev/null || true
+import json, os, sys, tempfile
+path, queue = sys.argv[1], sys.argv[2]
+try:
+    cfg = json.load(open(path))
+except Exception:
+    sys.exit(0)
+if (cfg.get("queues") or {}).pop(queue, None) is None:
+    sys.exit(0)
+d = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(dir=d)
+with os.fdopen(fd, "w") as fh:
+    json.dump(cfg, fh, indent=2)
+    fh.write("\n")
+os.chmod(tmp, 0o644)
+os.replace(tmp, path)
+PYW
+}
+
+# Remember the mDNS service a queue was built from.
+#
+# The queue itself has to hold an ADDRESS -- this image cannot resolve .local,
+# so a name in the device URI would never connect. An address on DHCP is only
+# right until the lease changes, which is the owner's objection and a fair one.
+# Keeping the advert alongside it means the address can be looked up again
+# when it stops answering, instead of somebody having to notice and re-add it.
+set_queue_service() {
+    python3 - "$PRINTER_CFG" "$1" "$2" <<'PYW' 2>/dev/null || true
+import json, os, sys, tempfile
+path, queue, service = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    cfg = json.load(open(path))
+    if not isinstance(cfg, dict):
+        cfg = {}
+except Exception:
+    cfg = {}
+cfg.setdefault("queues", {}).setdefault(queue, {})["service"] = service
+d = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(dir=d)
+with os.fdopen(fd, "w") as fh:
+    json.dump(cfg, fh, indent=2)
+    fh.write("\n")
+os.chmod(tmp, 0o644)
+os.replace(tmp, path)
+PYW
+}
+
+# Which queues are this display's OWN hardware.
+#
+# Only local hardware may be shared. A queue that is itself a remote printer --
+# one picked up from another display -- must never be re-advertised: two
+# displays each re-sharing the other's queue is a loop, and the job either
+# comes back round or lands nowhere. Judged on the device URI, which is the
+# only thing that actually says where the paper is.
+local_queues() {
+    for q in $(lpstat -a 2>/dev/null | cut -d' ' -f1); do
+        # `device for NAME: usb://...`. Anchored and non-greedy on purpose:
+        # `.*: *` is greedy and eats the scheme's own colon too, leaving
+        # "//EPSON/TM-T88V?serial=..." -- which matches none of the cases
+        # below, so a display with a real USB printer reported nothing to
+        # share. Found on .63, which had been printing all day.
+        uri=$(lpstat -v "$q" 2>/dev/null | sed -n 's/^device for [^:]*: *//p')
+        case "$uri" in
+            usb:*|serial:*|parallel:*|socket:*|hp:*|hpfax:*) echo "$q" ;;
+            # ipp:, ipps:, dnssd:, implicitclass: are somebody else's printer.
+            *) ;;
+        esac
+    done
+}
+
+# Every line this feature adds to cupsd.conf carries this marker, so turning
+# sharing off removes exactly what turning it on added and nothing else.
+# Editing somebody's cupsd.conf by pattern and hoping is how a print server
+# ends up in a state no one can explain.
+# Is any local queue still shared? Decides whether cupsd needs to keep
+# listening beyond loopback at all. Top level, not inside the case branch:
+# a function defined inside a branch works at runtime but is invisible to
+# build/make-release.sh's "calls a function it does not define" check, and a
+# guard that cannot see a definition is a guard that stops the build.
+# `lpoptions -p NAME`, NOT `lpstat -l -p NAME`.
+#
+# lpstat -l reports description, location, connection and interface -- and
+# says nothing at all about sharing. The first version of this grepped it for
+# "shared: yes", which can never match, so every queue read back as not
+# shared: `lpadmin` had genuinely set the flag, the helper reported success,
+# and then withdrew the listener because it believed nothing was shared.
+# Found on .63 with a real printer. lpoptions prints `printer-is-shared=true`.
+# The command set a USB printer declares for itself.
+#
+# Every USB printer publishes an IEEE-1284 device id, and it names its own
+# language:
+#
+#     MFG:Star;CMD:STAR;MDL:TSP143 (STR_T-001);CLS:PRINTER
+#     MFG:EPSON;CMD:ESCPOS;MDL:TM-T88V;CLS:PRINTER
+#
+# Asked because guessing wrong is silent. A Star TSP100/TSP143 sent ESC/POS
+# raster discards the whole job: no error, no paper, and CUPS reports it
+# printed. Two days of "the printer does not work" on .94 came down to that.
+printer_language() {
+    uri="$1"
+    # The queue's URI carries the serial; match it back to a device node so a
+    # display with two printers asks the right one.
+    ser=$(printf '%s' "$uri" | sed -n 's/.*[?&]serial=\([^&]*\).*/\1/p')
+    for f in /sys/class/usbmisc/lp*/device/ieee1284_id; do
+        [ -r "$f" ] || continue
+        id=$(cat "$f" 2>/dev/null)
+        case "$id" in
+            *"$ser"*) ;;
+            *) [ -n "$ser" ] && continue ;;
+        esac
+        case "$id" in
+            *CMD:*STAR*|*COMMAND\ SET:*STAR*) echo star; return ;;
+            *CMD:*ESCPOS*|*CMD:*ESC/POS*)      echo escpos; return ;;
+        esac
+    done
+    echo ""
+}
+
+# Is this display serving printers on the network at all?
+#
+# The marker in cupsd.conf is the whole answer: without it cupsd listens on
+# loopback and nothing outside can reach any queue, however it is flagged.
+listening() {
+    grep -q "$SHARE_TAG" /etc/cups/cupsd.conf 2>/dev/null
+}
+
+# How long the oldest unfinished job on a queue has been waiting, in seconds.
+#
+# From the spool file's mtime, not from lpstat's printed date: that is
+# rendered in whatever locale and timezone the machine happens to be in, and
+# parsing it back is a way to be wrong quietly. CUPS writes the control file
+# when the job is created and does not rewrite it while the job waits.
+# Tell a printer to stop counting.
+#
+# ESC/POS has no framing: a raster is a byte count followed by that many
+# bytes, so a job cut off part way leaves the printer still counting and
+# every byte of every later job is eaten as image data. Cancelling, or a job
+# CUPS gave up on, is how six queued jobs once came out as six feet of noise.
+#
+# `reset` knows socket printers; a USB one is written to directly, which is
+# the same ESC @.
+reset_printer() {
+    uri=$(lpstat -v "$1" 2>/dev/null | sed -n 's/^device for [^:]*: *//p')
+    case "$uri" in
+        socket://*) "$0" reset "$1" >/dev/null 2>&1 || true ;;
+        usb://*)
+            for d in /dev/usb/lp*; do
+                [ -e "$d" ] || continue
+                printf '\033@' > "$d" 2>/dev/null || true
+            done ;;
+    esac
+}
+
+job_age_seconds() {
+    python3 - "$1" <<'PYAGE' 2>/dev/null || echo 0
+import glob, os, subprocess, sys, time
+
+q = sys.argv[1]
+try:
+    out = subprocess.run(["lpstat", "-W", "not-completed", "-o", q],
+                         capture_output=True, text=True, timeout=15).stdout
+except Exception:
+    print(0); raise SystemExit
+
+oldest = 0
+for line in out.splitlines():
+    if not line or line[0].isspace():
+        continue
+    jid = line.split()[0]                 # e.g. TM-T88V-42
+    num = jid.rsplit("-", 1)[-1]
+    if not num.isdigit():
+        continue
+    for f in glob.glob("/var/spool/cups/c%05d" % int(num)):
+        try:
+            oldest = max(oldest, int(time.time() - os.path.getmtime(f)))
+        except OSError:
+            pass
+print(oldest)
+PYAGE
+}
+
+queue_shared() {
+    # BOTH halves, because either alone is a lie.
+    #
+    # `printer-is-shared` DEFAULTS TO TRUE in CUPS. Reading it alone showed
+    # every queue as shared on a display that was listening on loopback only
+    # -- so the admin page drew the box already ticked, there was nothing to
+    # tick, and the printers were not reachable. `.178` could not see `.94`'s
+    # printers for exactly this reason while both said "shared".
+    listening || return 1
+    _queue_share_flag "$1"
+}
+
+_queue_share_flag() {
+    # printers.conf is the authority, and this helper runs as root so it can
+    # read it. CUPS writes `Shared Yes` / `Shared No` inside each <Printer>
+    # block, and that is what cupsd itself acts on.
+    #
+    # Two wrong answers were tried first, both on real hardware:
+    #   * `lpstat -l -p NAME` -- reports description, location, connection and
+    #     interface, and says NOTHING about sharing. Grepping it for
+    #     "shared: yes" can never match, so every queue read back as unshared:
+    #     lpadmin had genuinely set the flag, the helper reported success, and
+    #     then withdrew the listener because it believed nothing was shared.
+    #   * `lpoptions -p NAME` -- correct as the kiosk user, but under sudo it
+    #     came back without the attribute, so the same false negative returned
+    #     wearing a different hat.
+    # The file does not depend on who is asking.
+    if [ -r /etc/cups/printers.conf ]; then
+        awk -v want="$1" '
+            /^[[:space:]]*<(Default)?Printer / { cur = $2; sub(">", "", cur) }
+            /^[[:space:]]*Shared[[:space:]]+/ {
+                if (cur == want) { print tolower($2); found = 1; exit }
+            }
+            END { if (!found) print "" }' /etc/cups/printers.conf \
+          | grep -q '^yes$' && return 0
+        # An explicit "Shared No", or no Shared line at all, means not shared.
+        return 1
+    fi
+    # Fallback for a machine where printers.conf cannot be read at all.
+    lpoptions -p "$1" 2>/dev/null | tr ' ' '\n' \
+        | grep -q '^printer-is-shared=true$'
+}
+
+# Is any queue OTHER than $1 shared?
+#
+# Deliberately excludes the one being changed, because cupsd writes
+# printers.conf LAZILY: immediately after `lpadmin -o printer-is-shared=true`
+# the file still says the old value. Reading it back to decide whether to open
+# the listener gave the previous answer, so turning sharing ON immediately
+# turned the listener off again -- `share state` then said shared=yes while
+# `ss` showed loopback, because by the time anyone looked, cupsd had flushed
+# the file. The same lag is why kiosk.py re-reads the queue list twice after
+# the printer modal closes.
+#
+# So the decision is made from what we KNOW: the queue we just set, plus the
+# others read from disk. Never from a read-back of our own write.
+others_shared() {
+    # The FLAG, not queue_shared: this decides whether the listener stays up,
+    # so asking a question that itself depends on the listener would always
+    # answer "yes" while it is up and "no" the moment it goes down.
+    for q in $(local_queues); do
+        [ "$q" = "$1" ] && continue
+        _queue_share_flag "$q" && { echo yes; return; }
+    done
+    echo no
+}
+
+SHARE_TAG="# added by kiosk-printer share"
+
+cups_share_conf() {
+    # $2 is the file, so this can be exercised against a copy rather than only
+    # against a live print server. A transform that edits the real cupsd.conf
+    # and cannot be tested anywhere else gets tested in a shop.
+    python3 - "$1" "$SHARE_TAG" "${2:-/etc/cups/cupsd.conf}" <<'PYS'
+import re, sys
+want, tag = sys.argv[1], sys.argv[2]
+path = sys.argv[3]
+src = open(path).read()
+
+# The loopback listener is REPLACED, not supplemented.
+#
+# `Port 631` binds 0.0.0.0. cupsd binds `Listen localhost:631` first, so the
+# wildcard bind then fails outright:
+#     Unable to open listen socket for address 0.0.0.0:631 - Address already
+#     in use.
+# cupsd carried on with loopback only, and every layer above reported success.
+# That error is in /var/log/cups/error_log, which the kiosk user cannot read,
+# which is why `share diag` exists.
+#
+# So the original line is commented out with a marker that carries its exact
+# text, and put back verbatim when sharing is turned off.
+WAS = "#SS-WAS#"
+
+lines = src.split("\n")
+out, skip_next = [], False
+for l in lines:
+    if skip_next:
+        skip_next = False
+        continue
+    if l.strip() == tag:
+        skip_next = True      # drop the marker AND the directive it introduced
+        continue
+    # The LEGACY form, written by the version that appended the marker to the
+    # end of the directive. cupsd does not accept a trailing comment: it reads
+    # the remainder as the value, rejects the file and falls back to its
+    # built-in default. It has to be removed here or it never goes.
+    if l.rstrip().endswith(tag):
+        continue
+    if l.startswith(WAS):
+        out.append(l[len(WAS):])          # restore what we commented out
+        continue
+    out.append(l)
+lines = out
+
+if want == "on":
+    out, done_listen, done_loc = [], False, False
+    for l in lines:
+        if not done_listen and re.match(r"^\s*Listen\s+localhost:631", l):
+            out.append(tag)
+            out.append("Port 631")
+            out.append(WAS + l)           # keep the original, verbatim
+            done_listen = True
+            continue
+        out.append(l)
+        if not done_loc and re.match(r"^\s*<Location\s+/>\s*$", l):
+            # @LOCAL is CUPS's own name for "an address on a subnet this
+            # machine is actually on". Not "any address" -- a print server
+            # reachable from the internet is not what anybody asked for.
+            out.append(tag)
+            out.append("  Allow @LOCAL")
+            done_loc = True
+    if not done_listen:
+        print("ERROR: no 'Listen localhost:631' to replace", file=sys.stderr)
+        sys.exit(1)
+    if not done_loc:
+        print("ERROR: no '<Location />' to add to", file=sys.stderr)
+        sys.exit(1)
+    lines = out
+
+open(path, "w").write("\n".join(lines))
+PYS
+}
+
+set_printing_enabled() {
+    python3 - "$PRINTER_CFG" "$1" <<'PYW'
+import json, os, sys, tempfile
+path, val = sys.argv[1], sys.argv[2] == "yes"
+try:
+    cfg = json.load(open(path))
+    if not isinstance(cfg, dict):
+        cfg = {}
+except Exception:
+    cfg = {}
+cfg["printing_enabled"] = val
+d = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(dir=d)
+with os.fdopen(fd, "w") as fh:
+    json.dump(cfg, fh, indent=2)
+    fh.write("\n")
+os.chmod(tmp, 0o644)
+os.replace(tmp, path)
+PYW
+}
+
+printing_wanted() {
+    python3 - "$PRINTER_CFG" <<'PYW' 2>/dev/null || echo yes
+import json, sys
+try:
+    print("yes" if json.load(open(sys.argv[1])).get("printing_enabled", True)
+          else "no")
+except Exception:
+    print("yes")
+PYW
+}
+
+# No mountpoint(1) dependency: /proc/mounts is always there and always right.
+is_mounted() { awk -v t="$1" '$2 == t { found = 1 } END { exit !found }' /proc/mounts; }
+
+# The first USB device CUPS can see. Plain single quotes -- this line once
+# carried '"'"' sequences, correct when a script is written from inside
+# another quoted string and wrong once it is the file itself. The shell then
+# expanded awk's $2 as its own second argument and, with `set -u` and no
+# second argument, the helper died with "2: parameter not set".
+first_usb_uri() { lpinfo -v 2>/dev/null | awk '/usb:/ {print $2; exit}'; }
+
+no_usb() {
+    echo "no USB printer found; pass a URI" >&2
+    lpinfo -v 2>/dev/null | sed 's/^/  /' >&2
+    exit 1
+}
+
+# Ask the running client whether a queue can print, and why not.
+#
+# Deliberately not a second implementation. The paper query is fiddly enough
+# to get wrong once already (the fixed bits in the ESC/POS reply), and two
+# copies of it would be two chances to get it wrong again. kiosk.py works this
+# out for the admin page; this asks it the same question.
+#
+# Silent when it cannot ask -- no client running, or an admin password set, in
+# which case we are no worse off than before this existed.
+queue_problem() {
+    _q=$1
+    _p=$(sed -n 's/.*"admin_port"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' \
+         /etc/kiosk/config.json 2>/dev/null | head -1)
+    for _c in "$_p" 80 8080; do
+        [ -n "$_c" ] || continue
+        _out=$(curl -fsS -m 12 --get --data-urlencode "name=$_q" \
+               "http://127.0.0.1:$_c/api/printer/ready" 2>/dev/null) || continue
+        printf '%s' "$_out" | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin).get('problem', ''))
+except Exception:
+    pass
+" 2>/dev/null
+        return 0
+    done
+    return 0
+}
+
+case "${1:-list}" in
+add-thermal)
+    # add-thermal NAME URI [DISCOVERED-FROM]
+    #
+    # The third argument is the dnssd advert this printer was found at, if it
+    # was found rather than typed. It is not what the queue points at -- that
+    # has to be an address -- it is how to find the address again later.
+    name="${2:-Thermal}"
+    uri="${3:-}"
+    service="${4:-}"
+    [ -f "$ESCPOS_PPD" ] || die "the ESC/POS PPD is not installed: $ESCPOS_PPD"
+    [ -x /usr/lib/cups/filter/rastertoescpos ] \
+        || die "the ESC/POS filter is not installed: /usr/lib/cups/filter/rastertoescpos"
+    [ -n "$uri" ] || uri=$(first_usb_uri)
+    [ -n "$uri" ] || no_usb
+    if ! lpadmin -p "$name" -v "$uri" -P "$ESCPOS_PPD" -E; then
+        lpadmin -x "$name" 2>/dev/null || true
+        die "CUPS refused $uri, so nothing was added."
+    fi
+    lpadmin -d "$name"
+    cupsenable "$name" 2>/dev/null || true
+    cupsaccept "$name" 2>/dev/null || true
+    [ -z "$service" ] || set_queue_service "$name" "$service"
+
+    # Ask the printer what it speaks rather than assuming ESC/POS. A Star
+    # discards ESC/POS raster in silence, so an unset option here is a queue
+    # that accepts every job and prints none of them.
+    lang=$(printer_language "$uri")
+    if [ "$lang" = star ]; then
+        lpadmin -p "$name" -o EscposProto=Star 2>/dev/null || true
+        # 576 dots is the TSP100/TSP143 printable width on 80 mm paper. The
+        # 512 the ESC/POS default assumes prints a narrow receipt on one.
+        set_width_dots "$name" 576 2>/dev/null || true
+        echo "this printer reports CMD:STAR, so the queue was set to Star Line"
+        echo "Mode at 576 dots. An ESC/POS queue would have printed nothing."
+    fi
+
+    echo "added $name -> $uri on the SteadyScreen ESC/POS bridge"
+    # Worth saying plainly: lpadmin does not contact the printer for this kind
+    # of queue. It will report success for an address that is switched off,
+    # wrong, or belongs to something that is not a printer at all. Only a test
+    # print can tell you it works, and this product has spent two days
+    # learning not to let "accepted" pass for "printed".
+    case "$uri" in
+        socket://*|lpd://*)
+            echo "nothing was asked of the printer to do this -- press Test print"
+            echo "to find out whether it can actually render a page." ;;
+    esac
+    ;;
+add-ipp)
+    # IPP Everywhere / AirPrint printers describe themselves, so CUPS builds
+    # the driver on the fly and no PPD is needed or wanted. This is the only
+    # sensible way to attach an office printer to a display; a receipt printer
+    # should go through add-thermal instead.
+    name="${2:?name}"; uri="${3:?uri}"
+    # lpadmin creates the queue and THEN goes to ask the printer what it is.
+    # When that second half fails -- wrong address, printer asleep, not
+    # actually IPP -- it leaves the queue behind with a device and no driver:
+    # a queue that accepts jobs and renders nothing, which is precisely the
+    # failure this subsystem has spent the day removing. Seen adding
+    # ipp://192.0.2.1. So clean up after a failure rather than leaving the
+    # operator to discover it.
+    if ! lpadmin -p "$name" -v "$uri" -m everywhere -E; then
+        lpadmin -x "$name" 2>/dev/null || true
+        die "CUPS could not set up $uri as a driverless printer, so nothing
+was added. Some printers only answer this over ipp:// on port 631, or need to
+be woken first. Check the address, or add it as a thermal printer if that is
+what it is."
+    fi
+    cupsenable "$name" 2>/dev/null || true
+    cupsaccept "$name" 2>/dev/null || true
+    echo "added $name -> $uri as a driverless IPP printer"
+    ;;
+list)
+    lpstat -a 2>/dev/null || echo "(no queues)"
+    # Which filter each queue actually renders through. /etc/cups/ppd is
+    # root-only, so without this there is no way to answer "what driver is
+    # this queue on?" short of becoming root -- and that is the first
+    # question whenever a printer misbehaves.
+    for ppd in /etc/cups/ppd/*.ppd; do
+        [ -f "$ppd" ] || continue
+        f=$(sed -n 's/^\*cupsFilter2*: *"\(.*\)".*/\1/p' "$ppd" \
+            | awk '{print $NF}' | head -1)
+        echo "driver=$(basename "$ppd" .ppd):${f:-none}"
+    done
+    echo "default=$(lpstat -d 2>/dev/null | sed 's/.*: *//')"
+    echo "persisted=$(is_mounted /etc/cups && echo yes || echo no)"
+    echo "width_default=$(width_dots) dots"
+    for q in $(lpstat -a 2>/dev/null | awk '{print $1}'); do
+        echo "width=$q:$(width_dots "$q")"
+    done
+    ;;
+detect)
+    # -l, not just -v.
+    #
+    # The short form gives class and URI and nothing else, so a network
+    # printer reached the operator as a bare address: eight rows reading
+    # "10.10.8.21", "10.10.8.22", "10.10.8.23" and no way to tell which is
+    # the one by the till. The long form carries `info` and
+    # `make-and-model`, which is what the printer calls itself.
+    #
+    # Emitted as extra `model=` lines rather than by changing the two-column
+    # format, because that format is parsed by the client and by anyone who
+    # has ever run this by hand.
+    lpinfo -l -v 2>/dev/null | awk '
+        function flush() {
+            if (uri == "") return
+            # A bare backend name -- "socket", "http", "beh" -- is CUPS
+            # naming a thing it has, not a printer it found.
+            if (uri ~ /:/) {
+                print cls " " uri
+                name = mm
+                if (name == "" || name == "Unknown") name = info
+                # An address is not a name. When `info` is just the
+                # host out of the URI there is nothing to add, and a row
+                # reading "10.10.8.21  10.10.8.21" is worse than one.
+                if (name != "" && name != "Unknown" && index(uri, name) == 0)
+                    printf "model=%s\t%s\n", uri, name
+            }
+            uri = ""; cls = ""; info = ""; mm = ""
+        }
+        /^Device: uri = /       { flush(); uri = substr($0, 15); next }
+        /^[ \t]*class = /        { cls  = substr($0, index($0, "= ") + 2); next }
+        /^[ \t]*info = /         { info = substr($0, index($0, "= ") + 2); next }
+        /^[ \t]*make-and-model = / { mm = substr($0, index($0, "= ") + 2); next }
+        END { flush() }
+    ' || true
+    ;;
+add-shared)
+    # A printer shared by ANOTHER display, added by address.
+    #
+    #   kiosk-printer add-shared NAME ipp://10.10.9.94:631/printers/TM-T88V
+    #
+    # Not add-ipp: that asks for IPP Everywhere, and a CUPS queue shared with
+    # a PPD does not answer as one -- lpadmin sits there querying it and
+    # eventually gives up. Seen between .178 and .94.
+    #
+    # A RAW queue instead, which is right here for a reason that is easy to
+    # get backwards: the job must reach the host UNCONVERTED so the host's
+    # own filter renders it. The host owns the printer, its language and its
+    # width; converting locally would send ESC/POS to something expecting a
+    # document, and converting at both ends would render twice.
+    #
+    # This is also the only way to use a shared printer on a network that
+    # does not carry mDNS, which is most managed networks: discovery needs
+    # multicast, this needs nothing but a route.
+    name="${2:?usage: kiosk-printer add-shared NAME URI}"
+    uri="${3:?usage: kiosk-printer add-shared NAME URI}"
+    case "$uri" in
+        ipp://*|ipps://*|http://*|https://*) ;;
+        *) die "add-shared expects an ipp:// address of a printer on another
+       display, for example ipp://10.10.9.94:631/printers/TM-T88V" ;;
+    esac
+    if ! lpadmin -p "$name" -v "$uri" -m raw -E; then
+        lpadmin -x "$name" 2>/dev/null || true
+        die "CUPS refused $uri, so nothing was added."
+    fi
+    cupsenable "$name" 2>/dev/null || true
+    cupsaccept "$name" 2>/dev/null || true
+    echo "added $name -> $uri"
+    echo "the display that owns the printer renders the job, so its width and"
+    echo "printer language are used, not this display's."
+    ;;
+add)
+    name="${2:?name}"; uri="${3:?uri}"; ppd="${4:-}"
+    if [ -n "$ppd" ] && [ -f "$ppd" ]; then
+        lpadmin -p "$name" -v "$uri" -P "$ppd" -E
+        echo "added $name with $ppd"
+    else
+        # -m raw: bytes straight through, which is right for ESC/POS and
+        # useless for printing an HTML page.
+        lpadmin -p "$name" -v "$uri" -m raw -E
+        echo "added $name as a RAW queue (ESC/POS only, cannot render HTML)"
+    fi
+    lpadmin -d "$name"
+    cupsenable "$name" 2>/dev/null || true
+    cupsaccept "$name" 2>/dev/null || true
+    ;;
+default) lpadmin -d "${2:?name}"; echo "default is now ${2}" ;;
+remove)
+    name="${2:?name}"
+    lpadmin -x "$name"
+    forget_width_dots "$name"
+    echo "removed $name"
+    ;;
+test)
+    name="${2:-$(lpstat -d 2>/dev/null | sed 's/.*: *//')}"
+    case "$name" in
+        ""|*"no system default"*)
+            echo "no default queue on this client -- nothing to test." >&2
+            echo "queues CUPS knows about:" >&2
+            lpstat -a 2>/dev/null | sed 's/^/  /' >&2 || echo "  (none)" >&2
+            exit 1 ;;
+    esac
+
+    ppd="/etc/cups/ppd/$name.ppd"
+    # A queue shared by ANOTHER display is deliberately raw here, and that is
+    # not the same fault. It has no PPD because it must not render: the job
+    # travels to the display that owns the printer and is rendered there, by
+    # the PPD that knows that printer's width and language. Rendering locally
+    # as well would print it twice over.
+    shared_remote=no
+    # Anchored, NOT `s/.*: *//`: that is greedy and strips through the last
+    # colon, so "device for X: ipp://10.10.9.94:631/printers/Y" came back as
+    # "631/printers/Y" and matched nothing. Third time this pattern has bitten
+    # in this file -- see local_queues.
+    case "$(lpstat -v "$name" 2>/dev/null | sed -n 's/^device for [^:]*: *//p')" in
+        ipp://*/printers/*|ipps://*/printers/*) shared_remote=yes ;;
+    esac
+
+    # A LOCAL raw queue takes ESC/POS bytes and nothing else, so it cannot
+    # render a page. The old code sent it a PDF and, failing that, plain text,
+    # and reported success either way. That is how a valid 54 KB test page
+    # came out as blank paper with the admin page saying it had worked.
+    if [ ! -f "$ppd" ] && [ "$shared_remote" = no ]; then
+        echo "queue '$name' is RAW: it has no PPD and cannot render a page." >&2
+        echo "jobs sent here print bytes, not documents. Rebuild it with:" >&2
+        echo "  kiosk-printer add-thermal $name" >&2
+        exit 2
+    fi
+
+    # The PPD names the program that turns the rendered page into printer
+    # bytes. When that program is missing -- an OS update replaced the slot,
+    # or the queue was built against a driver this image does not ship --
+    # CUPS accepts the job, marks it completed, and prints nothing at all.
+    missing=""
+    filters=""
+    # No PPD to read on a shared remote queue -- the filters that matter are
+    # on the display that owns the printer, and are its business.
+    [ -f "$ppd" ] && filters=$(sed -n 's/^\*cupsFilter2*: *"\(.*\)".*/\1/p' "$ppd" \
+                               | awk '{print $NF}')
+    for f in $filters; do
+        case "$f" in ""|-) continue ;; esac
+        case "$f" in /*) prog="$f" ;; *) prog="/usr/lib/cups/filter/$f" ;; esac
+        [ -x "$prog" ] || missing="$missing $prog"
+    done
+    [ -z "$missing" ] || {
+        echo "queue '$name' names filters that are not installed:$missing" >&2
+        echo "CUPS will accept jobs for it and print nothing." >&2
+        exit 3; }
+
+    # Ask before sending. A thermal printer with no paper does not refuse the
+    # job -- it takes the bytes and drops them, so CUPS marks it completed and
+    # the test says it printed. That happened on the bench: the first job with
+    # the roll pulled came back "printed", and only the SECOND stalled, once
+    # the printer's buffer was full. A test whose result depends on how full a
+    # buffer is, is not a test.
+    prob=$(queue_problem "$name")
+    if [ -n "$prob" ]; then
+        echo "$name is not ready: $prob" >&2
+        echo "Nothing was sent." >&2
+        exit 7
+    fi
+
+    # Clear anything the printer is still in the middle of before adding to
+    # it. Cheap, and it is the difference between one test page and one test
+    # page printed on top of the wreckage of an earlier job.
+    "$0" reset "$name" >/dev/null 2>&1 || true
+
+    have python3 || die "python3 is missing; cannot build the test page"
+    # Compose at the width this printer actually prints, rather than at 576 and
+    # hoping. A page built wider is not merely scaled down by the filter -- the
+    # printer drops the overflow, so the page loses its edge and everything
+    # centred sits half the difference off-centre.
+    dots=$(width_dots "$name")
+    tmp=$(mktemp /tmp/ss-test-XXXXXX.pdf)
+    err="$tmp.err"
+    trap 'rm -f "$tmp" "$err"' EXIT INT TERM
+    # No silent fallback to plain text. A test that quietly prints something
+    # other than the test page is not a test: the grey ramp, the hairlines
+    # and the reverse block are the whole point, because they are what shows
+    # the raster path is intact.
+    if ! python3 /usr/local/sbin/kiosk-testpage "$tmp" --width "$dots" 2>"$err"; then
+        echo "could not build the test page:" >&2
+        sed 's/^/  /' "$err" >&2
+        exit 4
+    fi
+    [ -s "$tmp" ] || { echo "the test page was built but came out empty." >&2; exit 4; }
+    size=$(stat -c%s "$tmp")
+
+    out=$(lp -d "$name" -o escposwidth="$dots" "$tmp" 2>&1) || {
+        echo "CUPS refused the job:" >&2
+        printf '%s\n' "$out" | sed 's/^/  /' >&2
+        exit 5; }
+    job=$(printf '%s' "$out" | sed -n 's/.*request id is \([^ ][^ ]*\).*/\1/p')
+
+    # "Sent" is not "printed". A job sits in the queue while the printer is
+    # out of paper, switched off or jammed, and the old code called that
+    # success the instant lp accepted it. Wait for the job to actually leave.
+    if [ -n "$job" ]; then
+        waited=0
+        while [ "$waited" -lt 30 ]; do
+            lpstat -o "$name" 2>/dev/null | grep -q "^$job " || break
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if lpstat -o "$name" 2>/dev/null | grep -q "^$job "; then
+            echo "$job is still in the queue after ${waited}s: it has not printed." >&2
+            lpstat -p "$name" -l 2>/dev/null | sed 's/^/  /' >&2
+            exit 6
+        fi
+    fi
+    # A queue that stops mid-job leaves the job gone and the printer disabled.
+    if lpstat -p "$name" 2>/dev/null | grep -q 'disabled'; then
+        echo "queue '$name' stopped while printing:" >&2
+        lpstat -p "$name" -l 2>/dev/null | sed 's/^/  /' >&2
+        exit 6
+    fi
+    echo "printed ${job:-a test page} on $name (${size} bytes, ${dots} dots wide)"
+    ;;
+width)
+    # width                      list every queue and what it will print at
+    # width <queue>              that queue's effective width
+    # width <queue> <dots>       set it for that queue
+    # width --default <dots>     set the fallback for queues with no setting
+    if [ -z "${2:-}" ]; then
+        echo "default=$(width_dots) dots"
+        for q in $(lpstat -a 2>/dev/null | awk '{print $1}'); do
+            echo "$q=$(width_dots "$q") dots"
+        done
+        exit 0
+    fi
+    if [ "$2" = "--default" ]; then
+        target=""; want="${3:-}"
+    else
+        target="$2"; want="${3:-}"
+        lpstat -a "$target" >/dev/null 2>&1 \
+            || die "there is no queue called '$target' on this display"
+    fi
+    if [ -z "$want" ]; then
+        echo "$(width_dots "$target")"
+        exit 0
+    fi
+    case "$want" in
+        *[!0-9]*|"") die "width must be a number of dots, e.g. 512" ;;
+    esac
+    [ "$want" -ge 128 ] && [ "$want" -le 1024 ] \
+        || die "width $want is out of range (128-1024 dots)"
+    # ESC/POS raster rows are whole bytes, so a width that is not a multiple
+    # of 8 is padded up by the printer anyway. Refusing is clearer than
+    # silently storing a number the hardware will not use.
+    [ $(( want % 8 )) -eq 0 ] \
+        || die "width must be a multiple of 8 dots (raster rows are whole bytes)"
+    set_width_dots "$target" "$want"
+    echo "${target:-default} width is now $want dots ($(( want * 254 / (203 * 10) )) mm at 203 dpi)"
+    ;;
+ruler)
+    name="${2:-$(lpstat -d 2>/dev/null | sed 's/.*: *//')}"
+    case "$name" in
+        ""|*"no system default"*) die "no default queue to print the ruler on" ;;
+    esac
+    prob=$(queue_problem "$name")
+    if [ -n "$prob" ]; then
+        echo "$name is not ready: $prob" >&2
+        echo "Nothing was sent." >&2
+        exit 7
+    fi
+    dots=$(width_dots "$name")
+    have python3 || die "python3 is missing; cannot build the ruler"
+    tmp=$(mktemp /tmp/ss-ruler-XXXXXX.pdf)
+    trap 'rm -f "$tmp"' EXIT INT TERM
+    python3 /usr/local/sbin/kiosk-testpage "$tmp" --ruler --width "$dots" \
+        --label "$name" || die "could not build the ruler"
+    lp -d "$name" -o escposwidth="$dots" "$tmp" >/dev/null \
+        || die "CUPS refused the ruler"
+    echo "printed a $dots-dot ruler on $name"
+    echo "read the largest number on the paper. If END is missing the printer"
+    echo "stopped early: set that width with 'kiosk-printer width <dots>'."
+    ;;
+enable|disable)
+    # A display showing a menu board has no printer and no reason to run a
+    # print server: cupsd is about 14 MB resident, four units and a fifth of
+    # a second of boot on these boards. Small, but it is also a listening
+    # service on a machine in somebody else is shop.
+    #
+    # Mask rather than disable. cups.socket and cups.path start the daemon on
+    # demand, so `disable` alone leaves it starting the first time anything
+    # touches a queue -- which is precisely what a display with no printer
+    # cannot be trusted not to do.
+    units="cups.service cups.socket cups.path cups-browsed.service"
+    if [ "$1" = disable ]; then
+        set_printing_enabled no
+        systemctl stop $units 2>/dev/null || true
+        systemctl mask $units 2>/dev/null || true
+        echo "printing disabled: cupsd is stopped and masked"
+    else
+        set_printing_enabled yes
+        systemctl unmask $units 2>/dev/null || true
+        systemctl enable --now cups.socket cups.service 2>/dev/null || true
+        # Prove it came back rather than reporting the command succeeded.
+        waited=0
+        while [ "$waited" -lt 15 ]; do
+            lpstat -r 2>/dev/null | grep -q "is running" && break
+            sleep 1
+            waited=$((waited + 1))
+        done
+        lpstat -r 2>/dev/null | grep -q "is running" \
+            || die "cups was unmasked but the scheduler did not come up"
+        echo "printing enabled: $(lpstat -a 2>/dev/null | wc -l) queue(s)"
+    fi
+    ;;
+migrate-thermal)
+    # The GPL-3 TM-T88V driver is being retired: our own bridge prints the
+    # same printer correctly, is 7 KB against its 127, covers every ESC/POS
+    # thermal printer rather than one model, and carries no GPL-3 obligation
+    # into a commercial image.
+    #
+    # The files cannot simply be deleted. A queue built on that driver keeps
+    # working only while the filter exists; take it away and CUPS accepts the
+    # job, marks it completed, and prints nothing -- the silent failure this
+    # whole subsystem has just been fixed for. So move the queues first, and
+    # do it on every client, before any release drops the files.
+    [ -f "$ESCPOS_PPD" ] || die "the ESC/POS PPD is not installed; not migrating"
+    moved=0
+    for ppd in /etc/cups/ppd/*.ppd; do
+        [ -f "$ppd" ] || continue
+        grep -q 'rastertotmt88v' "$ppd" 2>/dev/null || continue
+        name=$(basename "$ppd" .ppd)
+        # NOT `sed 's/.*: *//'`. That is greedy, so on
+        #   device for OldDriver: usb://EPSON/TM-T88V?serial=...
+        # it strips through the LAST colon -- the one inside "usb://" -- and
+        # hands lpadmin "//EPSON/TM-T88V?...". CUPS accepts that queue quite
+        # happily and every job then dies in the backend with "not available".
+        # Caught by `kiosk-printer test` refusing to call it printed.
+        uri=$(lpstat -v "$name" 2>/dev/null | sed "s|^device for $name: *||")
+        if [ -z "$uri" ]; then
+            echo "cannot find the device for $name; leaving it alone" >&2
+            continue
+        fi
+        was_default=no
+        [ "$(lpstat -d 2>/dev/null | sed 's/.*: *//')" = "$name" ] && was_default=yes
+        # -p on a queue that exists edits it in place, so the name, and
+        # anything already pointing at that name, survive.
+        if lpadmin -p "$name" -v "$uri" -P "$ESCPOS_PPD" -E; then
+            [ "$was_default" = yes ] && lpadmin -d "$name"
+            cupsenable "$name" 2>/dev/null || true
+            cupsaccept "$name" 2>/dev/null || true
+            echo "moved $name onto the SteadyScreen ESC/POS bridge"
+            moved=$((moved + 1))
+        else
+            echo "could not move $name; it is still on the old driver" >&2
+        fi
+    done
+    [ "$moved" -gt 0 ] || echo "no queue on this display uses the old driver"
+    ;;
+retire-tmt88v)
+    # Delete the GPL-3 driver from this client. Our bridge prints the same
+    # printer correctly, covers the whole ESC/POS class rather than one model,
+    # and carries no GPL-3 obligation into a commercial image.
+    #
+    # REFUSES while any queue still renders through it. A queue on a driver
+    # that has been deleted does not fail loudly: CUPS accepts the job, marks
+    # it completed, and prints nothing. `migrate-thermal` runs first, from the
+    # same place, so by the time this is reached there should be nothing left
+    # -- and if there is, that is a machine to look at, not to break.
+    inuse=$(grep -l 'rastertotmt88v' /etc/cups/ppd/*.ppd 2>/dev/null | wc -l)
+    if [ "$inuse" -gt 0 ]; then
+        echo "the TM-T88V driver is still behind $inuse queue(s) here;" >&2
+        echo "not removing it. Run: kiosk-printer migrate-thermal" >&2
+        exit 1
+    fi
+    removed=0
+    for f in /usr/lib/cups/filter/rastertotmt88v \
+             /usr/share/cups/model/epson-thermal-printer/epson-tm-t88v-rastertotmt88v.ppd
+    do
+        [ -e "$f" ] || continue
+        rm -f "$f" && removed=$((removed + 1))
+    done
+    rmdir /usr/share/cups/model/epson-thermal-printer 2>/dev/null || true
+    if [ "$removed" -gt 0 ]; then
+        echo "removed the GPL-3 TM-T88V driver ($removed file(s))"
+    fi
+    exit 0
+    ;;
+proto)
+    # kiosk-printer proto NAME star|escpos
+    #
+    # Which language a queue speaks. A USB printer is asked when it is added
+    # -- it publishes the answer -- but a NETWORK thermal printer publishes
+    # nothing, so somebody has to say. Also the way to correct a queue built
+    # before any of this existed.
+    name="${2:?usage: kiosk-printer proto NAME star|escpos}"
+    want="${3:?usage: kiosk-printer proto NAME star|escpos}"
+    lpstat -a "$name" >/dev/null 2>&1 || die "no such queue: $name"
+    case "$want" in
+        star)   val=Star ;;
+        escpos) val=ESCPOS ;;
+        *) die "language must be star or escpos" ;;
+    esac
+    lpadmin -p "$name" -o "EscposProto=$val" 2>/dev/null \
+        || die "could not set $name to $val"
+    if [ "$want" = star ]; then
+        # 576 dots is the TSP100/TSP143 printable width on 80 mm paper; the
+        # ESC/POS default of 512 prints a narrow receipt on one.
+        set_width_dots "$name" 576 2>/dev/null || true
+        echo "$name now speaks Star Line Mode at 576 dots"
+    else
+        echo "$name now speaks ESC/POS"
+    fi
+    ;;
+unwedge)
+    # Clear a queue that has stopped printing, without anybody driving to it.
+    #
+    # OUT OF PAPER IS NOT A WEDGE. A receipt waiting for a new roll is a
+    # receipt somebody wants, and the roll is going back in within minutes.
+    # Cancelling it would destroy the one thing this display exists to
+    # produce, silently, to tidy up a queue that was working correctly. Same
+    # for a cover left open. Those wait.
+    #
+    # What IS a wedge: CUPS sitting on a job it will not send to a printer
+    # that is ready and answering. And a queue CUPS has DISABLED after a
+    # failure, which nothing ever re-enables -- everything queued behind it
+    # waits for a person who does not know they are needed.
+    #
+    # Re-enabling destroys nothing, so it is done wherever the printer is
+    # reachable. Cancelling destroys work, so it is done only when the
+    # printer is plainly fine and the job is stuck anyway.
+    only="${2:-}"
+    if [ -n "$only" ]; then
+        set -- "$only"
+    else
+        set -- $(lpstat -a 2>/dev/null | awk '{print $1}')
+        [ $# -gt 0 ] || exit 0
+    fi
+
+    # How long a job may sit before a READY printer counts as wedged. Long
+    # enough that a big receipt on a slow printer is never mistaken for one.
+    stuck_minutes="${STUCK_MINUTES:-10}"
+    did=0
+
+    for q in "$@"; do
+        prob=$(queue_problem "$q")
+
+        case "$prob" in
+            "out of paper"|"paper jam"|"cover open")
+                # A person fixes this, and the job must survive until they do.
+                n=$(lpstat -W not-completed -o "$q" 2>/dev/null | wc -l)
+                [ "$n" -gt 0 ] \
+                    && echo "$q: $prob -- $n job(s) waiting for it, left alone"
+                continue ;;
+        esac
+
+        # A queue CUPS disabled after a failure. Nothing else turns it back
+        # on, and turning it on cannot lose anything.
+        if lpstat -p "$q" 2>/dev/null | grep -q "is not accepting\|disabled"; then
+            # Reset BEFORE re-enabling. Whatever failed may have stopped
+            # part-way through a raster, and ESC/POS has no framing -- the
+            # printer is still counting bytes and would eat the next job as
+            # image data. The queue coming back is exactly the moment a next
+            # job arrives.
+            reset_printer "$q"
+            cupsenable "$q" 2>/dev/null || true
+            cupsaccept "$q" 2>/dev/null || true
+            echo "$q had been disabled after a failure; reset and enabled again"
+            did=1
+        fi
+
+        # Only now consider cancelling, and only if the printer is fine.
+        [ -z "$prob" ] || continue
+        secs=$(job_age_seconds "$q")
+        [ "${secs:-0}" -ge $(( stuck_minutes * 60 )) ] || continue
+
+        echo "$q: printer is ready and a job has sat $(( secs / 60 )) minutes;"
+        echo "    clearing it"
+        cancel -a "$q" 2>/dev/null || true
+
+        reset_printer "$q"
+        cupsenable "$q" 2>/dev/null || true
+        cupsaccept "$q" 2>/dev/null || true
+        did=1
+    done
+    [ "$did" = 1 ] && echo "printing should work again"
+    exit 0
+    ;;
+reset)
+    # ESC @ -- initialise printer. Clears whatever it is in the middle of.
+    #
+    # ESC/POS has no framing. A raster is `GS v 0` followed by a byte count
+    # and then that many bytes of pixels, so a job cut off part way leaves the
+    # printer still counting: every byte after it, from any later job, is
+    # consumed as image data. Cancelling jobs on a paperless printer during
+    # testing did exactly that, and when the roll went back in it printed six
+    # feet of noise -- six queued jobs, several of them truncated, all
+    # interpreted as one long picture.
+    #
+    # Cancelling a job is not enough. The printer has to be told to stop
+    # counting.
+    name="${2:-$(lpstat -d 2>/dev/null | sed 's/.*: *//')}"
+    case "$name" in
+        ""|*"no system default"*) die "no queue to reset" ;;
+    esac
+    uri=$(lpstat -v "$name" 2>/dev/null | sed "s|^device for $name: *||")
+    case "$uri" in
+        socket://*) ;;
+        *) die "$name is not a network thermal printer; nothing to reset" ;;
+    esac
+    host=${uri#socket://}; port=${host##*:}
+    case "$host" in *:*) host=${host%:*} ;; *) port=9100 ;; esac
+    # Do not shove bytes at a printer that is working.
+    [ -z "$(lpstat -o "$name" 2>/dev/null)" ] \
+        || die "$name has jobs in its queue; cancel them first"
+    python3 - "$host" "$port" <<'PYW'
+import socket, sys
+host, port = sys.argv[1], int(sys.argv[2])
+try:
+    with socket.create_connection((host, port), timeout=3) as sk:
+        sk.sendall(b"\x1b@")          # ESC @
+except OSError as exc:
+    print("could not reach %s:%s (%s)" % (host, port, exc), file=sys.stderr)
+    raise SystemExit(1)
+PYW
+    echo "sent a reset to $name"
+    ;;
+reconcile)
+    # A mask lives in /etc/systemd, which is ON THE ROOT SLOT: an OS update
+    # replaces it and cupsd quietly comes back on a display that was told not
+    # to print. The durable answer is in printer.json on /data, and this puts
+    # the machine back in line with it. Run from kiosk-update, every time.
+    want=$(printing_wanted)
+    masked=no
+    systemctl is-enabled cups.service 2>/dev/null | grep -q masked && masked=yes
+    if [ "$want" = no ] && [ "$masked" = no ]; then
+        echo "printing should be off here; switching it off again"
+        exec "$0" disable
+    fi
+    if [ "$want" = yes ] && [ "$masked" = yes ]; then
+        echo "printing should be on here; switching it back on"
+        exec "$0" enable
+    fi
+    exit 0
+    ;;
+share)
+    # Per QUEUE, not per display. Sharing belongs to the printer somebody
+    # attached, so it sits with that printer in Manage printers rather than as
+    # one switch for the whole machine -- a display can perfectly well have a
+    # counter printer it lends out and a back-office one it does not.
+    #
+    #   kiosk-printer share state            per-queue report
+    #   kiosk-printer share on|off NAME      share one queue, or stop
+    want="${2:-state}"
+
+    case "$want" in
+      state)
+        for q in $(local_queues); do
+            if queue_shared "$q"; then
+                echo "queue=$q shared=yes"
+            else
+                echo "queue=$q shared=no"
+            fi
+        done
+        # Remote queues are named too, so the admin page can say WHY they
+        # carry no share control rather than just omitting it.
+        for q in $(lpstat -a 2>/dev/null | cut -d' ' -f1); do
+            local_queues | grep -qx "$q" || echo "queue=$q remote=yes"
+        done
+        if grep -q "$SHARE_TAG" /etc/cups/cupsd.conf 2>/dev/null; then
+            echo "listening=yes"
+        else
+            echo "listening=no"
+        fi
+        exit 0
+        ;;
+      diag)
+        # Why sharing is or is not actually reachable, from the machine's own
+        # point of view. Added because every layer above reported success
+        # while cupsd sat on loopback, and none of the evidence needed to see
+        # that is readable by the kiosk user.
+        [ "$(id -u)" = 0 ] || die "must run as root"
+        echo "== cupsd"
+        ps -eo args 2>/dev/null | grep "[c]upsd" | sed 's/^/  /'
+        echo "== bound"
+        ss -lnt 2>/dev/null | grep 631 | sed 's/^/  /' || echo "  (none)"
+        echo "== cups.socket"
+        systemctl cat cups.socket 2>/dev/null | grep -i "^ListenStream" | sed 's/^/  /'
+        echo "== our lines in cupsd.conf"
+        grep -nE "^Port|^Listen|Allow|added by kiosk-printer" /etc/cups/cupsd.conf \
+            2>/dev/null | sed 's/^/  /'
+        echo "== who has been talking to this print server"
+        # Added after a shared printer fed about five inches of paper
+        # overnight with nothing on screen to explain it. Whether anything was
+        # polling this queue is the first question, and nothing readable by
+        # the kiosk user could answer it.
+        awk '{ print $1 }' /var/log/cups/access_log 2>/dev/null \
+            | sort | uniq -c | sort -rn | head -6 | sed 's/^/  /' \
+            || echo "  (no access log)"
+        echo "== requests in the last hour"
+        tail -400 /var/log/cups/access_log 2>/dev/null \
+            | grep -c . | sed 's/^/  lines in tail: /'
+        tail -6 /var/log/cups/access_log 2>/dev/null | sed 's/^/  /'
+        echo "== jobs actually printed"
+        tail -6 /var/log/cups/page_log 2>/dev/null | sed 's/^/  /' \
+            || echo "  (no page log)"
+        echo "== USB events (a printer twitching with no job is usually here)"
+        # A thermal printer that feeds a little with nothing on screen to
+        # explain it is usually being re-enumerated, not printed to: the
+        # device resets and the motor steps. dmesg needs root, which is
+        # exactly why this could not be answered from the admin page.
+        dmesg 2>/dev/null \
+            | grep -iE "usblp|usb [0-9-]+: (new|USB disconnect|reset)" \
+            | tail -10 | sed 's/^/  /' || echo "  (no USB events)"
+        echo "== error_log (listen/port complaints)"
+        grep -iE "listen|port|unknown directive|bad " /var/log/cups/error_log \
+            2>/dev/null | tail -12 | sed 's/^/  /' || echo "  (nothing)"
+        exit 0
+        ;;
+      on|off) ;;
+      *) die "usage: kiosk-printer share state|diag | share on|off NAME" ;;
+    esac
+
+    [ "$(id -u)" = 0 ] || die "must run as root"
+    name="${3:?usage: kiosk-printer share on|off NAME}"
+
+    # A display told not to print must not become a print server for the shop.
+    # Checked before anything is written, not after.
+    if systemctl is-enabled cups.service 2>/dev/null | grep -q masked; then
+        die "printing is disabled on this display, so it cannot share a printer.
+       Run 'kiosk-printer enable' first if this display should print."
+    fi
+
+    lpstat -a "$name" >/dev/null 2>&1 || die "no such queue: $name"
+
+    # Only this display's OWN hardware. A queue that is itself another
+    # display's printer must never be re-advertised: two displays re-sharing
+    # each other is a loop, and the job either comes back round or lands
+    # nowhere.
+    if ! local_queues | grep -qx "$name"; then
+        die "$name is a printer on another machine, not hardware attached
+       here, so it is not re-shared. Share it from the display it is
+       plugged into."
+    fi
+
+    if [ "$want" = on ]; then
+        # Turning sharing on for the FIRST time: every other local queue is
+        # still carrying CUPS' default of printer-is-shared=true, and opening
+        # the listener would put all of them on the network at once. Somebody
+        # ticking "Share this printer" on one printer has not asked to share
+        # the one beside it. From here on the flag means what it says, because
+        # this is the point at which it stops being a default.
+        if ! listening; then
+            for q in $(local_queues); do
+                [ "$q" = "$name" ] && continue
+                lpadmin -p "$q" -o printer-is-shared=false 2>/dev/null || true
+            done
+        fi
+        lpadmin -p "$name" -o printer-is-shared=true  2>/dev/null \
+            || die "could not mark $name as shared"
+    else
+        lpadmin -p "$name" -o printer-is-shared=false 2>/dev/null \
+            || die "could not stop sharing $name"
+    fi
+
+    # The listener follows the queues. Opening 631 while nothing is shared is
+    # exposure for no purpose, so it is withdrawn as soon as the last shared
+    # queue is turned off.
+    #
+    # Turning one ON means at least one is shared -- no need to ask the disk
+    # about the write we just made. Turning one OFF asks only about the
+    # OTHERS. See others_shared.
+    if [ "$want" = on ] || [ "$(others_shared "$name")" = yes ]; then
+        cups_share_conf on  || die "could not update /etc/cups/cupsd.conf"
+    else
+        cups_share_conf off || die "could not update /etc/cups/cupsd.conf"
+    fi
+
+    systemctl restart cups.service 2>/dev/null || true
+    # Prove the scheduler came back. A sharing change that leaves cupsd dead
+    # takes the display's OWN printing with it, which is a much worse outcome
+    # than not sharing.
+    waited=0
+    while [ "$waited" -lt 15 ]; do
+        lpstat -r 2>/dev/null | grep -q "is running" && break
+        sleep 1
+        waited=$((waited + 1))
+    done
+    lpstat -r 2>/dev/null | grep -q "is running" \
+        || die "cups did not come back after changing sharing. /etc/cups is on
+       /data and the previous config is still there -- run
+       'kiosk-printer share off $name' to undo this."
+
+    if [ "$want" = on ]; then
+        echo "$name is shared. Other displays can add it from their own"
+        echo "Manage printers."
+    else
+        echo "$name is no longer shared."
+        [ "$(others_shared "$name")" = no ] && echo "nothing is shared now, so this display stopped listening."
+    fi
+    ;;
+state)
+    echo "wanted=$(printing_wanted)"
+    if systemctl is-enabled cups.service 2>/dev/null | grep -q masked; then
+        echo "printing=disabled"
+    else
+        echo "printing=enabled"
+    fi
+    echo "running=$(lpstat -r 2>/dev/null | grep -q 'is running' && echo yes || echo no)"
+    ;;
+persist)
+    # Printing is configured entirely outside /data, and nothing said so
+    # until a reinstall on 2026-08-28 took the queue with it. Afterwards
+    # cupsd still runs, `lpstat` still says "scheduler is running", the admin
+    # page shows no error, and every receipt silently goes nowhere.
+    #
+    # A queue is /etc/cups/printers.conf plus /etc/cups/ppd/<name>.ppd, so
+    # both have to move together -- and it has to be the whole directory, not
+    # a bind mount per file: cupsd rewrites printers.conf by rename, which
+    # detaches a single-file bind mount and leaves the changes invisible.
+    [ -d /data ] || die "no /data on this machine; nothing to persist to"
+    # Nothing to preserve on a display that has deliberately been told not to
+    # print, and starting cupsd to check would undo the operator's decision.
+    if systemctl is-enabled cups.service 2>/dev/null | grep -q masked; then
+        echo "printing is disabled on this display; nothing to persist"
+        exit 0
+    fi
+    if is_mounted /etc/cups; then
+        echo "/etc/cups is already persisted to /data"
+        exit 0
+    fi
+
+    before=$(lpstat -a 2>/dev/null | awk '{print $1}' | sort | tr '\n' ' ')
+
+    # STOP THE DAEMON BEFORE COPYING ANYTHING.
+    #
+    # cupsd keeps the queue list in memory and writes printers.conf lazily --
+    # it marks the file dirty and flushes it up to 30 seconds later. Copying
+    # while it runs therefore captures whatever was last flushed, not what
+    # CUPS actually believes. Doing it the other way round on .63 copied a
+    # printers.conf from before two test queues had been deleted, the shutdown
+    # flush then wrote the correct file into the directory about to be masked,
+    # and the mount brought both deleted queues back from the dead along with
+    # the wrong default printer.
+    #
+    # cups.socket and cups.path restart the daemon on demand, so stopping
+    # cups.service alone leaves it running and still holding the config.
+    systemctl stop cups.service cups.socket cups.path cups-browsed.service 2>/dev/null || true
+    # The flush happens during shutdown; give the file time to land.
+    waited=0
+    while [ "$waited" -lt 10 ]; do
+        systemctl is-active --quiet cups.service || break
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    mkdir -p /data/cups
+    if [ -z "$(ls -A /data/cups 2>/dev/null)" ]; then
+        cp -a /etc/cups/. /data/cups/ || {
+            systemctl start cups.socket cups.service 2>/dev/null || true
+            die "could not copy /etc/cups to /data"; }
+        [ -f /data/cups/cupsd.conf ] || {
+            systemctl start cups.socket cups.service 2>/dev/null || true
+            die "the copy of /etc/cups has no cupsd.conf; refusing to mount it"; }
+        echo "copied the current CUPS configuration to /data/cups"
+    else
+        # Already populated means a previous run got this far, or a reinstall
+        # left the real queue here while the fresh slot has an empty one.
+        # /data is the truth in both cases -- that is the entire point.
+        echo "/data/cups already holds a configuration; keeping it"
+    fi
+
+    # fstab before the mount, so a machine that loses power in between comes
+    # back persisted rather than half-done.
+    if ! grep -q '^/data/cups[[:space:]]' /etc/fstab; then
+        printf '%-34s %-35s %s\n' /data/cups /etc/cups 'none bind  0 0' >> /etc/fstab
+        echo "added the bind mount to /etc/fstab"
+    fi
+
+    if ! mount --bind /data/cups /etc/cups; then
+        sed -i '\#^/data/cups[[:space:]]#d' /etc/fstab
+        systemctl start cups.socket cups.service 2>/dev/null || true
+        die "could not bind-mount /data/cups onto /etc/cups; fstab change reverted"
+    fi
+    systemctl start cups.socket cups.service 2>/dev/null || true
+
+    # Prove it before claiming it. A mount that hides the queues is worse
+    # than no mount at all, and it would not show up until someone printed.
+    ok=no
+    waited=0
+    while [ "$waited" -lt 15 ]; do
+        if lpstat -r 2>/dev/null | grep -q 'is running'; then ok=yes; break; fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    after=$(lpstat -a 2>/dev/null | awk '{print $1}' | sort | tr '\n' ' ')
+    # Compare the queue NAMES, not how many there are. A stale copy can bring
+    # deleted queues back, which leaves the count higher rather than lower --
+    # and a count check waves that through. Any difference at all is wrong.
+    if [ "$ok" = no ] || [ "$after" != "$before" ]; then
+        umount /etc/cups 2>/dev/null || true
+        sed -i '\#^/data/cups[[:space:]]#d' /etc/fstab
+        systemctl restart cups.socket cups.service 2>/dev/null || true
+        die "queues changed across the move: before [$before] after [$after]; reverted"
+    fi
+    echo "/etc/cups now lives on /data (queues: ${before:-none})"
+    ;;
+*) echo "usage: kiosk-printer {list|detect|add|add-thermal|add-ipp|default|remove|test|width|ruler|persist|enable|disable|state|reconcile|migrate-thermal|retire-tmt88v|reset}" >&2
+   exit 1 ;;
+esac

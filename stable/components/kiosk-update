@@ -1,0 +1,804 @@
+#!/bin/bash
+# Check for and apply signed SteadyScreen client updates.
+#
+#   kiosk-update check          what is available, as JSON. Safe, read-only.
+#   kiosk-update apply          download, verify, and deploy
+#   kiosk-update apply --force  ignore the maintenance window
+#
+# Config: /etc/kiosk/update.json
+#   {"base_url": "...", "channel": "stable", "auto": false,
+#    "window_start": "03:00", "window_end": "05:00"}
+#
+# base_url points at a public release tree today and will point at the
+# Manager later; nothing else changes when it does.
+#
+# Trust chain, in order, and each step must pass before the next:
+#   1. the manifest carries an ssh signature made by the release key
+#   2. /etc/kiosk/update-signers holds the only key we accept, and is NOT
+#      updatable through this path -- rotating it is a deliberate manual act
+#   3. every component's sha256 must match the signed manifest
+#   4. everything is downloaded and verified BEFORE anything is installed
+#   5. kiosk-deploy does the install, so its validation and its automatic
+#      rollback of kiosk.py still apply
+set -uo pipefail
+
+CFG=/etc/kiosk/update.json
+SIGNERS=/etc/kiosk/update-signers
+STATE=/var/lib/kiosk/update-state.json
+DEPLOY=/usr/local/sbin/kiosk-deploy
+NS=steadyscreen-release
+PRINCIPAL=releases@steadyscreen.com
+
+INSTALLED_PATHS="kiosk.py=/usr/local/bin/kiosk.py
+kioskctl=/usr/local/bin/kioskctl
+kiosk-session=/usr/local/bin/kiosk-session
+kiosk-splash=/usr/local/sbin/kiosk-splash
+kiosk-set-name=/usr/local/sbin/kiosk-set-name
+kiosk-sshd-auth=/usr/local/sbin/kiosk-sshd-auth
+kiosk-passwd=/usr/local/sbin/kiosk-passwd
+kiosk-cec=/usr/local/sbin/kiosk-cec
+kiosk-audio=/usr/local/sbin/kiosk-audio
+kiosk-printer=/usr/local/sbin/kiosk-printer
+kiosk-screenconnect=/usr/local/sbin/kiosk-screenconnect
+kiosk-deploy=/usr/local/sbin/kiosk-deploy
+kiosk-update=/usr/local/sbin/kiosk-update
+kiosk-diag=/usr/local/sbin/kiosk-diag
+kiosk-netwatch=/usr/local/sbin/kiosk-netwatch
+kiosk-snapshot=/usr/local/sbin/kiosk-snapshot
+sudoers=/etc/sudoers.d/kiosk
+escpos-filter=/usr/lib/cups/filter/rastertoescpos
+escpos-ppd=/usr/share/cups/model/steadyscreen-escpos.ppd
+avahi-service=/etc/avahi/services/steadyscreen.service
+kiosk-testpage=/usr/local/sbin/kiosk-testpage
+kiosk-hwid=/usr/local/sbin/kiosk-hwid
+kiosk-osupdate=/usr/local/sbin/kiosk-osupdate
+kiosk-migrate-boot=/usr/local/sbin/kiosk-migrate-boot
+grub-ab.cfg=/usr/local/share/steadyscreen/grub-ab.cfg
+bash_profile=/home/kiosk/.bash_profile
+osk.js=/usr/local/share/steadyscreen/osk.js
+tone.py=/usr/local/share/steadyscreen/tone.py"
+
+die() { echo "$*" >&2; exit 1; }
+cfg() { python3 -c "
+import json,sys
+try: c=json.load(open('$CFG'))
+except Exception: c={}
+print(c.get('$1', '''$2'''))
+" 2>/dev/null || echo "$2"; }
+
+path_for() { echo "$INSTALLED_PATHS" | grep "^$1=" | cut -d= -f2; }
+
+# Ask the running client who it thinks it is. Deliberately NOT a third
+# implementation of the fingerprint: the installer has one in shell and
+# kiosk.py has one in python, and those two are already required to agree.
+# A third copy is a third thing to keep in step.
+# Which port the admin API is actually answering on.
+#
+# Never assume. The client serves 80, falls back to 8080 when an older image
+# cannot bind it, and config.json may still name either. Probing costs one
+# quick curl and cannot be wrong; assuming 8080 silently broke every update
+# the moment 80 became the only port.
+admin_port() {
+    _p=$(sed -n 's/.*"admin_port"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' \
+         /etc/kiosk/config.json 2>/dev/null | head -1)
+    for _c in "$_p" 80 8080; do
+        [ -n "$_c" ] || continue
+        if curl -fsS -m 2 -o /dev/null "http://127.0.0.1:$_c/api/status" \
+             2>/dev/null; then
+            echo "$_c"; return 0
+        fi
+    done
+    echo "${_p:-80}"          # nothing answered; say what it should be
+}
+
+identity_state() {
+    curl -fsS --max-time 5 "http://127.0.0.1:$(admin_port)/api/status" 2>/dev/null \
+        | python3 -c "
+import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(1)
+i = d.get('identity') or {}
+print('%s|%s|%s' % (i.get('ok', ''), i.get('id', ''), i.get('detail', '')))
+" 2>/dev/null
+}
+
+# An update must not be applied to a machine whose identity does not match its
+# hardware: that is a cloned disk or a data partition moved between machines,
+# and letting it update would quietly give two clients the same id -- which a
+# licence would then count once.
+check_identity() {
+    local state ok id detail
+    state=$(identity_state) || return 0        # API down: do not block updates
+    [ -n "$state" ] || return 0
+    ok="${state%%|*}"; state="${state#*|}"
+    id="${state%%|*}"; detail="${state#*|}"
+    [ -n "$id" ] && echo "client $id"
+    if [ "$ok" = "False" ]; then
+        echo "REFUSING: $detail" >&2
+        echo "Fix the identity before updating -- see identity.json." >&2
+        return 1
+    fi
+    [ -n "$detail" ] && echo "note: $detail"
+    return 0
+}
+
+installed_version() {
+    sed -n 's/^VERSION = "\(.*\)"/\1/p' /usr/local/bin/kiosk.py 2>/dev/null | head -1
+}
+
+# The OS this slot is. A plain integer since os 1; anything else is a client
+# from before the two versions were separated, which is older than all of them.
+installed_os() {
+    local v
+    v=$(cat /etc/steadyscreen-os-version 2>/dev/null | tr -d ' \t\n')
+    case "$v" in
+        ''|*[!0-9.]*|.*|*.) echo 0 ;;
+        *) echo "$v" ;;
+    esac
+}
+
+# newer | older | same | unknown  -- how the manifest compares to what is running
+#
+# A leading "b" marks a beta build and is stripped before comparing, so b1.4.0
+# and 1.4.0 order as the same release rather than sorting alphabetically into
+# nonsense. Everything shipped so far is beta; the prefix is a label for
+# humans, not part of the ordering.
+version_direction() {
+    local have="$1" want="$2"
+    [ -n "$have" ] && [ -n "$want" ] || { echo unknown; return; }
+    [ "$have" = "$want" ] && { echo same; return; }
+    local h="${have#b}" w="${want#b}"
+    [ "$h" = "$w" ] && { echo same; return; }
+    if [ "$(printf '%s\n%s\n' "$h" "$w" | sort -V | head -1)" = "$h" ]; then
+        echo newer
+    else
+        echo older
+    fi
+}
+
+# NetworkManager gives a connection FOUR autoconnect attempts and then stops
+# trying it until something prods it -- a reboot, an `nmcli con up`, or the
+# device disappearing and coming back. An access point that is off for longer
+# than that leaves the display offline after it returns, with nothing on the
+# machine ever trying again. That is a dark screen all day for a router that
+# rebooted at 3am, and a site visit for a fault that repaired itself before
+# anyone noticed. Measured on .63 and .169 on 2026-09-02: both stayed offline
+# after the AP came back, both needed a power cycle.
+#
+# `install_wifi` writes autoconnect-retries=0 into the profile it seeds, so
+# new installs are already right. Every machine installed before that still
+# has the default and there is no other path to them -- so it is repaired
+# here, and it covers EVERY saved profile rather than only the one we wrote,
+# because a wired profile gives up in exactly the same way when a switch
+# reboots.
+#
+# By UUID, not by name: `nmcli -t` escapes a colon in a name as "\:", and
+# feeding that back to nmcli names a connection that does not exist. A UUID
+# cannot contain a colon, so the split is safe.
+repair_wifi_retries() {
+    command -v nmcli >/dev/null 2>&1 || return 0
+    local rows row uuid type name cur said=0
+    rows=$(nmcli -t -f UUID,TYPE,NAME connection show 2>/dev/null) || return 0
+    [ -n "$rows" ] || return 0
+    while IFS= read -r row; do
+        uuid="${row%%:*}"; row="${row#*:}"
+        type="${row%%:*}"; name="${row#*:}"
+        [ -n "$uuid" ] || continue
+        # NetworkManager keeps a loopback profile of its own. Retrying it
+        # means nothing, and changing it is noise in a log that has to stay
+        # worth reading.
+        [ "$type" = loopback ] && continue
+        cur=$(nmcli -g connection.autoconnect-retries connection show "$uuid" \
+              2>/dev/null)
+        # 0 is "never stop trying". -1 is "use the default", and the default
+        # is four -- so -1 is the value that has to be repaired, and it is the
+        # one that reads like it means "unlimited".
+        [ "$cur" = 0 ] && continue
+        if nmcli connection modify "$uuid" \
+             connection.autoconnect-retries 0 >/dev/null 2>&1; then
+            [ $said -eq 0 ] && echo "==> letting saved networks keep retrying"
+            said=1
+            echo "    $name: ${cur:--1} -> 0 (never give up on this network)"
+        else
+            echo "    warning: could not set autoconnect-retries on $name" >&2
+        fi
+    done <<< "$rows"
+    return 0
+}
+
+# The watchdog's systemd units live in /etc/systemd/system, which is on the
+# ROOT SLOT -- so an OS update takes them away and the watchdog quietly stops
+# existing, exactly as the printer mask did. The script writes them itself, so
+# there is one copy of them and it is the one in the component; this just asks
+# it to, on every pass.
+#
+# Called TWICE, and the second call is not redundant. A brand new component is
+# skipped by the pass that introduces it -- the old updater computed `changed`
+# and had never heard of it -- so on the pass that finally installs
+# kiosk-netwatch, the repair block above it ran when the file did not yet
+# exist. Without the second call the units would arrive an hour later, and
+# "the watchdog is installed but not running" is exactly the kind of half
+# state that gets read as "the watchdog says nothing is wrong".
+repair_netwatch_units() {
+    [ -x /usr/local/sbin/kiosk-netwatch ] || return 0
+    local out
+    out=$(/usr/local/sbin/kiosk-netwatch install 2>&1) || true
+    [ -z "$out" ] || printf '%s\n' "$out" | sed 's/^/    /'
+    return 0
+}
+
+in_window() {
+    local s e now
+    s=$(cfg window_start 03:00); e=$(cfg window_end 05:00)
+    now=$(date +%H:%M)
+    # string compare works because all are zero-padded HH:MM
+    if [ "$s" \< "$e" ]; then
+        [ "$now" \> "$s" ] && [ "$now" \< "$e" ]
+    else                      # window crosses midnight
+        [ "$now" \> "$s" ] || [ "$now" \< "$e" ]
+    fi
+}
+
+# The tree to fetch from. `channel` used to be reported and nothing else, so
+# choosing one changed the display and not the source. It is authoritative
+# now: it replaces the last path segment of base_url, but ONLY when that
+# segment is already a channel name. A base_url pointing somewhere else --
+# the Manager, later -- is left exactly as it is rather than having its last
+# segment eaten.
+effective_base() {
+    local base ch
+    base=$(cfg base_url "")
+    base="${base%/}"
+    ch=$(cfg channel "")
+    case "$ch" in
+        stable|testing) ;;
+        *) echo "$base"; return ;;
+    esac
+    case "${base##*/}" in
+        stable|testing) echo "${base%/*}/$ch" ;;
+        *) echo "$base" ;;
+    esac
+}
+
+fetch_manifest() {
+    local base tmp
+    base=$(effective_base)
+    [ -n "$base" ] || die "no base_url configured in $CFG"
+    tmp="$1"
+    # Cache-bust the manifest. The release host caches each file
+    # independently, so a plain fetch can pair a fresh component with a stale
+    # manifest -- which fails its checksum and refuses, correctly but
+    # confusingly. Seen for real on 2026-08-28. The components are then
+    # fetched with the manifest's own version as the cache key, so the two can
+    # never come from different releases.
+    [ -f "$SIGNERS" ] || die "no trust anchor at $SIGNERS -- refusing to update"
+
+    local bust; bust=$(date +%s)
+    curl -fsS --max-time 30 -H "Cache-Control: no-cache" \
+         -o "$tmp/manifest.json"     "$base/manifest.json?t=$bust"     \
+        || die "cannot reach the release host at $base"
+    curl -fsS --max-time 30 -H "Cache-Control: no-cache" \
+         -o "$tmp/manifest.json.sig" "$base/manifest.json.sig?t=$bust" \
+        || die "cannot reach the release host at $base"
+
+    # The manifest and its signature are cached INDEPENDENTLY by the release
+    # host, so for a few minutes after a release a client is handed a stale
+    # manifest with the new signature. They genuinely do not match and this
+    # check correctly fails -- but the cause is a CDN, not an attacker.
+    #
+    # Do not say so to whoever is standing at the display. "Signature is NOT
+    # valid" invites exactly one question -- have we been hacked? -- and the
+    # honest answer is almost always no. What IS true either way, and is what
+    # the caller reports, is that there is nothing installable: an unverified
+    # manifest is not something this client will ever act on.
+    #
+    # The real reason still goes to stderr, so the journal and `kiosk-diag`
+    # keep it. Calm on the screen, complete in the log.
+    if ! ssh-keygen -Y verify -f "$SIGNERS" -I "$PRINCIPAL" -n "$NS" \
+             -s "$tmp/manifest.json.sig" < "$tmp/manifest.json" >/dev/null 2>&1; then
+        echo "kiosk-update: the release listing did not match its signature." >&2
+        echo "  Nothing was downloaded and nothing was installed. This is" >&2
+        echo "  normally the release host still serving an older copy just" >&2
+        echo "  after a release, and clears within a few minutes." >&2
+        echo "  Source: $base" >&2
+        return 1
+    fi
+    return 0
+}
+
+# what differs between the signed manifest and what is installed
+diff_list() {
+    python3 - "$1/manifest.json" <<'PY'
+import json, sys, hashlib, os
+m = json.load(open(sys.argv[1]))
+paths = dict(l.split("=",1) for l in os.environ["INSTALLED_PATHS"].splitlines() if l)
+out = []
+for name, meta in m.get("components", {}).items():
+    p = paths.get(name)
+    if not p:
+        # Not silent: an updater older than the release does not know where a
+        # newly added component lives, so it cannot place it. Saying so is the
+        # difference between "run the update again" and a feature that appears
+        # in the admin page with nothing behind it.
+        print("SKIP:" + name, file=sys.stderr)
+        continue
+    if not os.path.exists(p):
+        out.append(name); continue
+    h = hashlib.sha256(open(p,"rb").read()).hexdigest()
+    if h != meta["sha256"]:
+        out.append(name)
+print("\n".join(out))
+PY
+}
+
+# Refuse software that this OS cannot run.
+#
+# The policy is that OS updates happen only when the software needs them, and
+# that when they do, the two ship together. That is only a policy if something
+# enforces it: otherwise a component update lands on a client whose root
+# filesystem lacks the package it depends on, and the failure appears later,
+# somewhere else, as a feature that quietly does nothing.
+#
+# Versions are dotted and compared COMPONENT-WISE: 1 < 1.1 < 1.2 < 1.10 < 2.
+# Read as decimals, 1.10 would be smaller than 1.9. kiosk-osupdate's os_cmp
+# does the same thing in the same way -- if you change one, change both.
+check_os_requirement() {
+    REQ_MANIFEST="$1/manifest.json" REQ_HAVE="$(installed_os)" python3 -c "
+import json, os, sys
+
+def parts(v):
+    v = (v or '0').strip()
+    try:
+        return [int(c) for c in v.split('.')]
+    except ValueError:
+        return [0]          # pre-split marker: older than every numbered OS
+
+try:
+    need = json.load(open(os.environ['REQ_MANIFEST'])).get('requires_os', 0)
+except Exception:
+    need = 0
+a, b = parts(os.environ['REQ_HAVE']), parts(str(need))
+n = max(len(a), len(b)); a += [0]*(n-len(a)); b += [0]*(n-len(b))
+if a >= b:
+    sys.exit(0)
+print('This release needs OS %s; this machine is on OS %s.'
+      % (need, os.environ['REQ_HAVE']), file=sys.stderr)
+print('Run the OS update first -- it carries the matching software with it:',
+      file=sys.stderr)
+print('    sudo kiosk-osupdate apply --reboot', file=sys.stderr)
+sys.exit(1)
+"
+}
+
+# Merge fields into the state file, rather than overwrite it.
+#
+# The check path and the install path each own different keys now, and a plain
+# `>` from either would erase the other's. Read-modify-write through a temp
+# file and os.replace, so a machine that loses power mid-write keeps the old
+# state instead of a truncated one.
+#
+# Recording an outcome must never change it: a read-only or missing state
+# directory is a reporting problem, not an update failure. Every path here
+# returns 0.
+record_state() {
+    mkdir -p "$(dirname "$STATE")" 2>/dev/null || {
+        echo "warning: could not create $(dirname "$STATE")" >&2; return 0; }
+    STATE_FILE="$STATE" python3 -c "
+import json, os, sys
+p = os.environ['STATE_FILE']
+try:
+    with open(p) as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        d = {}
+except Exception:
+    d = {}
+for kv in sys.argv[1:]:
+    k, _, v = kv.partition('=')
+    d[k] = True if v == 'true' else False if v == 'false' else v
+tmp = p + '.new'
+with open(tmp, 'w') as f:
+    json.dump(d, f, indent=1, sort_keys=True)
+os.replace(tmp, p)
+" "$@" 2>/dev/null || echo "warning: could not write $STATE" >&2
+    return 0
+}
+
+# What the hourly firing does on the 22 hours a day it is not allowed to
+# install anything.
+#
+# Until 2026-09-03 it did nothing at all. The window gate exited BEFORE the
+# manifest was ever fetched, so 22 of every 24 firings cost no network and
+# left no trace -- and `last_check` was written only at the end of a
+# successful APPLY, carrying the same timestamp as `last_applied`. It never
+# meant "when did this display last check". A display that had not spoken to
+# the release host in six months was indistinguishable from one that checked
+# an hour ago.
+#
+# This is the cheap half and only the cheap half: fetch the manifest, compare
+# it with what is installed, write down what was seen. No components are
+# downloaded, nothing is installed, the browser is not restarted. Installing
+# stays inside the maintenance window, because installing restarts the browser
+# and that is what the window is for -- not bandwidth.
+#
+# It runs even when `auto` is off. Reading a manifest is not changing the
+# machine, and a display deliberately set to manual updates is exactly the one
+# whose operator needs telling that something is waiting for them.
+#
+# fetch_manifest calls die() on a network failure, and die() exits. Calling it
+# directly here would abort cmd_apply before the repairs below ever ran -- the
+# same "a repair that only runs while other work is happening is a repair that
+# never runs" trap those repairs were moved to avoid. The subshell contains
+# the exit; the files it wrote into $tmp survive it.
+record_check() {
+    local tmp ver changed
+    tmp=$(mktemp -d) || return 0
+    record_state "last_check_attempt=$(date -Is)"
+    if ! ( fetch_manifest "$tmp" ) ; then
+        record_state "last_check_result=unreachable"
+        rm -rf "$tmp"
+        return 0
+    fi
+    export INSTALLED_PATHS
+    changed=$(diff_list "$tmp" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//') || changed=""
+    ver=$(python3 -c "import json;print(json.load(open('$tmp/manifest.json'))['version'])" \
+          2>/dev/null) || ver=""
+    record_state "last_check=$(date -Is)" "last_check_result=ok" \
+                 "available=$ver" \
+                 "pending=$([ -n "$changed" ] && echo true || echo false)"
+    rm -rf "$tmp"
+    return 0
+}
+
+cmd_check() {
+    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+    if ! fetch_manifest "$tmp"; then
+        # Truthful and calm: we cannot verify a listing, so there is nothing
+        # this client can install. Reported as a normal empty result rather
+        # than a failure, because to the person reading it that is what it is.
+        # The technical reason travels in the JSON so the admin page can offer
+        # it behind an info symbol -- available to anyone who asks, in nobody's
+        # face by default. What a shop sees and what a tester sees should be
+        # the same client behaving the same way, differing only in how much it
+        # volunteers.
+        python3 -c "
+import json
+print(json.dumps({
+  'available': '', 'installed': '$(installed_version)',
+  'changed': [], 'update_available': False,
+  'channel': '$(cfg channel stable)',
+  'note': 'a new release may be on its way -- check back shortly',
+  'note_detail': ('The release listing did not match its signature, so '
+                  'nothing was downloaded and nothing was installed -- this '
+                  'client is running exactly what it was. Almost always the '
+                  'release host is still serving an older copy just after a '
+                  'release, which clears within a few minutes. If it is still '
+                  'saying this in an hour, tell whoever manages the displays; '
+                  'do not reinstall or reconfigure anything.'),
+}, indent=2))"
+        # A person pressed Check for updates and it could not reach the host.
+        # Recorded for the same reason the unattended path records it: the
+        # admin page must not go on saying "last checked 3 days ago" with no
+        # hint that something has been trying and failing since.
+        record_state "last_check_attempt=$(date -Is)" "last_check_result=unreachable"
+        exit 0
+    fi
+    export INSTALLED_PATHS
+    changed=$(diff_list "$tmp" | tr '\n' ' ' | sed 's/ *$//')
+    ver=$(python3 -c "import json;print(json.load(open('$tmp/manifest.json'))['version'])")
+    have=$(installed_version)
+    # This IS a check, and the button that runs it is the one a person presses
+    # when they want to know. Without this the page could say "last checked 9
+    # days ago" in the same breath as showing a result fetched one second ago.
+    record_state "last_check_attempt=$(date -Is)" "last_check=$(date -Is)" \
+                 "last_check_result=ok" "available=$ver" \
+                 "pending=$([ -n "$changed" ] && echo true || echo false)"
+    dir=$(version_direction "$have" "$ver")
+    python3 -c "
+import json
+print(json.dumps({
+  'available': '$ver',
+  'installed': '$have',
+  'os_installed': '$(installed_os)',
+  'os_required': '$(python3 -c "
+import json
+try: print(json.load(open('$tmp/manifest.json')).get('requires_os', 0))
+except Exception: print(0)" 2>/dev/null || echo 0)',
+  'direction': '$dir',
+  'channel': '$(cfg channel stable)',
+  'source': '$(effective_base)',
+  'changed': '''$changed'''.split(),
+  'update_available': bool('''$changed'''.strip()),
+  'in_window': $( in_window && echo True || echo False ),
+  'window': '$(cfg window_start 03:00)-$(cfg window_end 05:00)',
+  'auto': $(cfg auto False | sed 's/true/True/;s/false/False/;s/^$/False/'),
+}, indent=2))"
+}
+
+cmd_apply() {
+    [ "$(id -u)" = 0 ] || die "must run as root"
+    force=0; allow_down=0
+    for a in "$@"; do
+        [ "$a" = "--force" ] && force=1
+        [ "$a" = "--allow-downgrade" ] && allow_down=1
+    done
+    # `auto` was reported and never read, so the hourly timer applied whatever
+    # was published regardless of the setting. On a machine sitting in a shop
+    # that is a surprise update to somebody else's business. --force is what
+    # the admin page's button sends, and a person pressing Install now has
+    # decided; only the unattended path is gated.
+    # The check comes FIRST, before either gate, because it is the only thing
+    # the unattended run can usefully do outside the window and it is the
+    # thing that makes a stale display visible. See record_check.
+    #
+    # Not on --force: that is the admin page's button, which is about to fetch
+    # the same manifest and install from it, and will record the outcome
+    # itself a few lines below.
+    if [ $force -eq 0 ]; then
+        record_check
+    fi
+
+    if [ $force -eq 0 ]; then
+        case "$(cfg auto false | tr 'A-Z' 'a-z')" in
+            true|1|yes) ;;
+            *) echo "automatic updates are switched off for this client; not applying"
+               exit 0 ;;
+        esac
+    fi
+    if [ $force -eq 0 ] && ! in_window; then
+        echo "outside the maintenance window ($(cfg window_start 03:00)-$(cfg window_end 05:00)); not applying"
+        exit 0
+    fi
+    # Printing is configured on the root slot -- the queue and its PPD live in
+    # /etc/cups -- so a client that prints today stops printing at the next OS
+    # update, silently, because cupsd comes back healthy with zero queues.
+    #
+    # THIS RUNS BEFORE EVERY EARLY EXIT, and that placement is the whole point.
+    # It was first written after the deploy loop, which meant it only ran when
+    # there was something to install: the client that installed the release
+    # carrying it skipped it (the old updater ran the deploy, the new one only
+    # ever saw a second pass), and every client already up to date would have
+    # skipped it forever. A repair that only runs while other work is
+    # happening is a repair that never runs.
+    #
+    # It is after the auto and window gates on purpose. Turning automatic
+    # updates off means "do not change this machine unattended", and this
+    # changes the machine. Auto-on clients self-heal within the hour; auto-off
+    # clients do it on the next `apply --force`, which is a person asking.
+    #
+    # Best effort. A client that cannot persist its printer setup is still a
+    # client whose update should succeed -- most of them have no printer.
+    if [ -x /usr/local/sbin/kiosk-printer ] && [ -d /data ] \
+       && ! awk '$2 == "/etc/cups" { f = 1 } END { exit !f }' /proc/mounts; then
+        echo "==> making sure the printer setup survives the next update"
+        # Not `... | sed ... || warn`: a pipeline's status is its LAST
+        # command's, so sed succeeding would swallow every failure here.
+        if pout=$(/usr/local/sbin/kiosk-printer persist 2>&1); then
+            printf '%s\n' "$pout" | sed 's/^/    /'
+        else
+            printf '%s\n' "$pout" | sed 's/^/    /' >&2
+            echo "    warning: /etc/cups is NOT on /data; printing will not survive an update" >&2
+        fi
+    fi
+
+    # A display told not to print records that on /data, but the mask that
+    # carries it out lives in /etc/systemd on the root slot -- so an OS update
+    # hands it back a running print server. Put it back the way it was asked
+    # to be. Cheap, silent when there is nothing to do.
+    if [ -x /usr/local/sbin/kiosk-printer ]; then
+        rout=$(/usr/local/sbin/kiosk-printer reconcile 2>&1) || true
+        [ -z "$rout" ] || printf '%s\n' "$rout" | sed 's/^/    /'
+
+        # The GPL-3 TM-T88V driver is on its way out of the image. A queue
+        # built on it keeps working only while the filter is there, so every
+        # such queue has to be moved onto our own bridge BEFORE any release
+        # stops shipping the file -- otherwise the first release that drops it
+        # turns a working printer into a queue that accepts jobs and prints
+        # nothing. Silent when there is nothing on the old driver.
+        mout=$(/usr/local/sbin/kiosk-printer migrate-thermal 2>&1) || true
+        case "$mout" in
+            *"no queue on this display"*) ;;
+            "") ;;
+            *) printf '%s\n' "$mout" | sed 's/^/    /' ;;
+        esac
+
+        # ...and then delete it. Strictly after the migration above: the
+        # driver's files are what a queue built on it renders through, so
+        # removing them first would turn a working printer into one that
+        # accepts jobs and prints nothing. retire-tmt88v refuses while any
+        # queue still uses it, so the order is enforced in two places rather
+        # than just here.
+        rmout=$(/usr/local/sbin/kiosk-printer retire-tmt88v 2>&1) || true
+        [ -z "$rmout" ] || printf '%s\n' "$rmout" | sed 's/^/    /'
+    fi
+
+    # Same placement, same reason: before every early exit, so it reaches a
+    # client that has nothing to install -- which is most of them, most of the
+    # time. Silent when there is nothing to change.
+    repair_wifi_retries
+
+    # And the watchdog's own units. See repair_netwatch_units.
+    repair_netwatch_units
+
+    check_identity || exit 4
+    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+    if ! fetch_manifest "$tmp"; then
+        # Same reasoning as cmd_check: an unverified listing is not something
+        # this client will act on, so there is nothing to install. Exit 0 --
+        # the hourly timer must not start flagging this as a failed unit for
+        # what is normally a few minutes of release-host cache.
+        echo "nothing to install"
+        exit 0
+    fi
+    check_os_requirement "$tmp" || exit 5
+    export INSTALLED_PATHS
+    changed=$(diff_list "$tmp")
+    [ -n "$changed" ] || { echo "already up to date"; exit 0; }
+
+    # A client can be AHEAD of the published release -- a hand-deployed build,
+    # or a release that was rolled back. Hash comparison cannot tell newer from
+    # older, so without this an "update" silently installs an older release
+    # over a newer one and reports success. That happened on 2026-08-27.
+    # ver_want must be read BEFORE it is compared. It used to be assigned a
+    # few lines further down, so under `set -u` the comparison ran against an
+    # unset variable, the subshell died, and `dir` came back empty -- which is
+    # never "older". The downgrade guard below has therefore never once fired
+    # since it was written. Found 2026-08-28 while reading the path, not from
+    # a failure: a guard that silently does nothing reports nothing.
+    ver_want=$(python3 -c "import json;print(json.load(open('$tmp/manifest.json'))['version'])")
+    ver_have=$(installed_version)
+    dir=$(version_direction "$ver_have" "$ver_want")
+    if [ "$dir" = older ] && [ $allow_down -eq 0 ]; then
+        echo "refusing: this client runs $ver_have and the published release is" >&2
+        echo "$ver_want, which is older. Pass --allow-downgrade to install it anyway." >&2
+        exit 3
+    fi
+
+    base=$(effective_base)
+    # Snapshot the state before touching anything. Cheap -- the state set is a
+    # few megabytes and unchanged files are hardlinks -- and it is the only
+    # thing standing between a bad release and a site visit. Never fatal: a
+    # client with no snapshot capability must still be able to update, or one
+    # missing helper stops the fleet.
+    if [ -x /usr/local/sbin/kiosk-snapshot ]; then
+        /usr/local/sbin/kiosk-snapshot create "before-$ver_want" >/dev/null 2>&1 \
+            || echo "    (could not snapshot first; continuing)" >&2
+    fi
+
+    echo "==> downloading and verifying (nothing is installed until all pass)"
+    for c in $changed; do
+        curl -fsS --max-time 120 -H "Cache-Control: no-cache" \
+             -o "$tmp/$c" "$base/components/$c?v=$ver_want" \
+            || die "download failed: $c"
+        want=$(python3 -c "import json;print(json.load(open('$tmp/manifest.json'))['components']['$c']['sha256'])")
+        got=$(sha256sum "$tmp/$c" | cut -d' ' -f1)
+        if [ "$want" != "$got" ]; then
+            # Refusing is right -- never install code that does not match what
+            # was signed. But the usual cause is not tampering: the release
+            # host caches the manifest and each component separately, so for a
+            # few minutes after a release a fresh component can arrive with a
+            # stale manifest. It clears itself, and the timer will retry.
+            echo "checksum mismatch on $c" >&2
+            echo "  manifest expects $want" >&2
+            echo "  downloaded file  $got" >&2
+            echo "Usually a release published minutes ago: the manifest and" >&2
+            echo "the components are cached separately and briefly disagree." >&2
+            echo "Nothing has been installed. It will retry." >&2
+            exit 5
+        fi
+        echo "    ok  $c"
+    done
+
+    # kiosk-deploy first, kiosk.py last.
+    #
+    # kiosk-deploy is what places everything else, and a copy older than the
+    # release refuses component names it does not know -- which aborts the
+    # whole run on the first new helper. Updating it before it is used means a
+    # release that adds a component can install that component.
+    #
+    # kiosk.py stays last: it restarts the browser and is the only one with a
+    # rollback, so everything else is settled before the risky step runs.
+    ordered=$(echo "$changed" | grep '^kiosk-deploy$'
+              echo "$changed" | grep -v '^kiosk-deploy$' | grep -v '^kiosk\.py$'
+              echo "$changed" | grep '^kiosk\.py$')
+    rc=0
+    for c in $ordered; do
+        [ -n "$c" ] || continue
+        echo "==> deploying $c"
+        if ! "$DEPLOY" "$c" < "$tmp/$c"; then
+            echo "    FAILED: $c" >&2; rc=1; break
+        fi
+    done
+
+    # Anything just installed that has to be wired into systemd. Silent when
+    # there was nothing new.
+    [ $rc -eq 0 ] && repair_netwatch_units
+
+    # If the updater just replaced itself, its component list may name paths
+    # the old one had never heard of -- and `changed` was computed by the OLD
+    # one, so those were skipped. Seen on .245 going b1.12.6 -> b1.13.1:
+    # "SKIP:kiosk-snapshot", then kiosk.py installed and referring to a helper
+    # that was not there, and the client reporting the new version the whole
+    # time. Without this it self-corrects an hour later, which is an hour of a
+    # client that is only partly the version it claims.
+    if [ $rc -eq 0 ] && [ -z "${KIOSK_UPDATE_SECOND_PASS:-}" ] \
+       && printf '%s\n' "$changed" | grep -q '^kiosk-update$'; then
+        echo "==> the updater replaced itself; checking what it now knows"
+        KIOSK_UPDATE_SECOND_PASS=1 "$0" apply --force
+    fi
+
+    ver=$(python3 -c "import json;print(json.load(open('$tmp/manifest.json'))['version'])")
+    # Recording the outcome must never change it: a read-only or missing
+    # state directory is a reporting problem, not an update failure.
+    # Merge, never overwrite. This used to `>` the whole file, which would now
+    # erase everything record_check had written -- last_check would go back to
+    # meaning "when did an install last finish", which is the bug this pair of
+    # functions exists to fix.
+    #
+    # last_check is set here too: an install fetched and compared the manifest,
+    # so the display genuinely has just checked.
+    record_state "last_check=$(date -Is)" "last_check_result=ok" \
+                 "last_applied=$(date -Is)" "version=$ver" \
+                 "available=$ver" \
+                 "pending=$([ $rc -eq 0 ] && echo false || echo true)" \
+                 "result=$([ $rc -eq 0 ] && echo ok || echo failed)"
+    exit $rc
+}
+
+# Write one setting into the update config. The admin page runs unprivileged
+# and $CFG is root-owned, so this is the only way it can change them -- and
+# keeping the whitelist here rather than in the caller means a client cannot
+# be talked into pointing itself at somebody else's release tree. base_url is
+# deliberately NOT settable: that is the trust root of the update path.
+cmd_config() {
+    [ "$(id -u)" = 0 ] || die "must run as root"
+    local key="${1:-}" val="${2:-}"
+    case "$key" in
+        auto)
+            case "$(echo "$val" | tr 'A-Z' 'a-z')" in
+                true|1|yes|on)  val=true ;;
+                false|0|no|off) val=false ;;
+                *) die "auto must be true or false" ;;
+            esac ;;
+        channel)
+            case "$val" in
+                stable|testing) val="\"$val\"" ;;
+                *) die "channel must be stable or testing" ;;
+            esac ;;
+        *) die "not a settable key: $key" ;;
+    esac
+    python3 - "$CFG" "$key" "$val" <<'CFGWRITE' || die "could not write $CFG"
+import json, os, sys, tempfile
+path, key, raw = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path) as fh:
+        cfg = json.load(fh)
+except Exception:
+    cfg = {}
+cfg[key] = json.loads(raw)
+d = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(dir=d)
+try:
+    with os.fdopen(fd, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(tmp, 0o644)
+    # Replace in one step. A half-written update.json is a client that cannot
+    # be told to update again.
+    os.replace(tmp, path)
+except Exception:
+    os.unlink(tmp)
+    raise
+CFGWRITE
+    echo "$key set to $val"
+}
+
+case "${1:-}" in
+    check) cmd_check ;;
+    apply) shift; cmd_apply "$@" ;;
+    config) shift; cmd_config "$@" ;;
+    *) echo "usage: kiosk-update {check|apply [--force]|config <key> <value>}" >&2
+       exit 1 ;;
+esac
