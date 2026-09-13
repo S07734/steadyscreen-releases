@@ -1,0 +1,230 @@
+#!/usr/bin/python3
+"""Compose the SteadyScreen printer test page as a PDF.
+
+Drawn for paper, not reused from the screen.
+
+The boot splash is light artwork on a dark background, which is right on a
+display and wrong on a receipt: thermal printers lay down black, so an
+inverted screen splash becomes a slab of ink -- slow, wasteful, and hard on
+the head. It also loses the parts that matter. Measured on the real artwork,
+`steadyscreen.com` is 18 pixels tall in an 880-pixel image, so at 576-dot
+paper width it lands at about six pixels and cannot be read at any dither.
+
+So: the logo mark comes from the splash's **alpha channel**, which is exactly
+the artwork and nothing else -- no background to invert, no colour to wash
+out -- and every piece of text is rendered natively at a size chosen for
+paper.
+
+    kiosk-testpage /path/out.pdf [--width 576]
+    kiosk-testpage /path/out.pdf --ruler [--width 576] [--label NAME]
+
+The ruler is a diagnostic, not decoration. A thermal printer that is set to a
+narrower print area than it is being sent simply drops the dots past its
+limit: no error, no status, the page just loses its right-hand edge, and
+anything centred lands off-centre by half the difference. Measured on the
+TM-T88V on .63, which was set to 64 mm (512 dots) while every page was being
+composed for 72 mm (576). Printing the ruler and reading the last number that
+appears is the only way to find out what a given printer will actually put on
+paper.
+"""
+import json
+import os
+import sys
+
+DPI = 203
+WIDTHS = {"80": 576, "58": 384}
+SPLASH = "/usr/share/plymouth/themes/kiosk/splash.png"
+FONT_DIR = "/usr/share/fonts/truetype/dejavu"
+IDENTITY = "/etc/kiosk/identity.json"
+
+
+def font(size, bold=True):
+    from PIL import ImageFont
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    try:
+        return ImageFont.truetype(os.path.join(FONT_DIR, name), size)
+    except Exception:                                         # noqa: BLE001
+        return ImageFont.load_default()
+
+
+def logo_mark(width):
+    """The mark from the splash, as black line art on white, or None.
+
+    The first band of opaque pixels is the mark. Found by scanning the alpha
+    channel rather than by hard-coded coordinates, so a redesigned splash does
+    not silently print the wrong crop.
+    """
+    try:
+        from PIL import Image, ImageOps
+    except Exception:                                         # noqa: BLE001
+        return None
+    try:
+        sp = Image.open(SPLASH).convert("RGBA")
+    except Exception:                                         # noqa: BLE001
+        return None
+    alpha = sp.getchannel("A")
+    w, h = alpha.size
+    px = alpha.load()
+    rows = [sum(px[x, y] for x in range(0, w, 3)) for y in range(h)]
+    peak = max(rows) or 1
+    top = bottom = None
+    for y, v in enumerate(rows):
+        if v > peak * 0.01:
+            if top is None:
+                top = y
+            bottom = y
+        elif top is not None and y - bottom > 20:
+            break                                   # end of the first band
+    if top is None:
+        return None
+    band = alpha.crop((0, top, w, bottom + 1))
+    box = band.getbbox()
+    if not box:
+        return None
+    mark = ImageOps.invert(band.crop(box))          # opaque -> black
+    return mark.resize((width, int(mark.height * width / mark.width)),
+                       Image.LANCZOS)
+
+
+def ruler(dots, label=""):
+    """A dot ruler for finding a printer's real printable width.
+
+    Read the largest number that appears on the paper. If the END block is
+    missing, the printer stopped before the end of the page -- reprint at that
+    width and it will fit.
+    """
+    from PIL import Image, ImageDraw
+
+    img = Image.new("L", (dots, 320), 255)
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 0, dots - 1, 10], fill=0)          # full-width rule
+    for x in range(0, dots, 16):
+        h = 46 if x % 64 == 0 else (30 if x % 32 == 0 else 18)
+        d.line([(x, 20), (x, 20 + h)], fill=0, width=2)
+    small = font(22, False)
+    for x in range(0, dots, 64):
+        d.text((x + 3, 72), str(x), font=small, fill=0)
+    # The last 64 dots, filled, with a word on them. No END means the page was
+    # cut short -- which is the entire point of printing this.
+    d.rectangle([dots - 64, 110, dots - 1, 160], fill=0)
+    d.text((dots - 60, 120), "END", font=font(24), fill=255)
+    d.text((4, 120), "0 <", font=font(24), fill=0)
+    d.text((4, 176), "ruler 0-%d dots  %d dpi" % (dots - 1, DPI),
+           font=small, fill=0)
+    # Which printer this came out of. A ruler is used to SET a width, so one
+    # that does not say where it came from is a measurement waiting to be
+    # applied to the wrong printer -- and the button that prints it may have
+    # fallen back to the backup, which is the right thing to do and exactly
+    # when you most need the paper to say so.
+    if label:
+        d.text((4, 202), label[:40], font=small, fill=0)
+    d.rectangle([0, 232, dots - 1, 240], fill=0)
+    return img.crop((0, 0, dots, 254))
+
+
+def main():
+    out = sys.argv[1] if len(sys.argv) > 1 else "/tmp/steadyscreen-test.pdf"
+    dots = WIDTHS["80"]
+    if "--width" in sys.argv:
+        try:
+            dots = int(sys.argv[sys.argv.index("--width") + 1])
+        except (IndexError, ValueError):
+            pass
+
+    from PIL import Image, ImageDraw
+
+    if "--ruler" in sys.argv:
+        label = ""
+        if "--label" in sys.argv:
+            try:
+                label = sys.argv[sys.argv.index("--label") + 1]
+            except IndexError:
+                pass
+        ruler(dots, label).save(out, "PDF", resolution=DPI)
+        return 0
+
+    try:
+        ident = json.load(open(IDENTITY))
+    except Exception:                                         # noqa: BLE001
+        ident = {}
+
+    mark = logo_mark(int(dots * 0.66))
+    page = Image.new("L", (dots, 1000), 255)
+    d = ImageDraw.Draw(page)
+    y = 8
+
+    def centre(text, f, gap=10):
+        """Centre the ink, not the glyph box.
+
+        textbbox returns (x0, y0, x1, y1) and x0 is the first glyph's left
+        side bearing -- it is not zero. Taking x1 as the width therefore
+        centres the text *plus its own bearing*, so every line is off by a
+        different amount depending on which letter it starts with. The ink is
+        x1 - x0 wide, and the draw origin has to be pulled back by x0 to land
+        that ink where it was measured.
+        """
+        nonlocal y
+        x0, _, x1, y1 = d.textbbox((0, 0), text, font=f)
+        d.text(((dots - (x1 - x0)) // 2 - x0, y), text, font=f, fill=0)
+        y += y1 + gap
+
+    if mark is not None:
+        page.paste(mark, ((dots - mark.width) // 2, y))
+        y += mark.height + 16
+    centre("SteadyScreen", font(int(dots * 0.094)), 12)
+    centre("steadyscreen.com", font(int(dots * 0.062), False), 22)
+
+    d.line([(0, y), (dots, y)], fill=0, width=3)
+    y += 16
+    centre("Printer test page", font(int(dots * 0.052)), 16)
+
+    # A grey ramp is the honest check that the filter dithers rather than
+    # thresholds: a threshold prints this as two blocks, not eight.
+    small = font(int(dots * 0.042), False)
+    d.text((14, y), "Grey ramp", font=small, fill=0)
+    y += 30
+    steps, pad = 8, 14
+    # Integer division leaves a remainder, and putting it all on the right
+    # made the ramp sit 4 dots left of where the rules say the middle is.
+    bw = (dots - pad * 2) // steps
+    left = (dots - bw * steps) // 2
+    for i in range(steps):
+        v = int(255 - i * (255 / (steps - 1)))
+        d.rectangle([left + i * bw, y, left + (i + 1) * bw - 3, y + 52], fill=v)
+    y += 66
+
+    d.text((14, y), "Hairlines", font=small, fill=0)
+    y += 30
+    for i, weight in enumerate((5, 4, 3, 2, 1)):
+        d.line([(14, y + i * 11), (dots - 14, y + i * 11)], fill=0,
+               width=weight)
+    y += 64
+
+    # Reverse text: the head has to lay solid black and leave paper for glyphs.
+    d.rectangle([0, y, dots - 1, y + 48], fill=0)
+    d.text((16, y + 8), "REVERSE 0123456789", font=font(int(dots * 0.05)),
+           fill=255)
+    y += 62
+
+    # Derive the millimetres from the dots. The old line said "80mm" for 576
+    # and "58mm" for literally anything else, so a printer set to 512 dots
+    # printed a page captioned 58mm while measuring 64 -- a diagnostic page
+    # lying about the one measurement it exists to report.
+    # "wide" because this is the PRINTED width, not the paper width: 576 dots
+    # is 72 mm of ink on an 80 mm roll. Conflating the two is how a printer
+    # set to 64 mm looked like it was simply mis-centred.
+    for line in ("%.0fmm wide  %d dots  %d dpi" % (dots * 25.4 / DPI, dots, DPI),
+                 ident.get("name", ""),
+                 (ident.get("id", "") or "")[:36]):
+        if line:
+            d.text((14, y), line, font=small, fill=0)
+            y += 30
+
+    d.line([(0, y + 6), (dots, y + 6)], fill=0, width=3)
+    page.crop((0, 0, dots, min(y + 40, page.height))).save(
+        out, "PDF", resolution=DPI)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

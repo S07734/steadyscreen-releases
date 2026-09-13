@@ -1,0 +1,260 @@
+#!/bin/sh
+# Audio output selection and volume for the display client.
+#
+#   kiosk-audio list                 outputs, one per line, live ones marked
+#   kiosk-audio status               current output, volume, mute
+#   kiosk-audio set-output C D       route sound to card C device D ("auto")
+#   kiosk-audio volume N             0-100
+#   kiosk-audio mute on|off
+#   kiosk-audio test                 short tone on the current output
+#
+# Why this is not just "amixer set Master":
+#
+# HDMI audio has NO hardware volume control. On the Pipo the whole card
+# exposes nothing but jack-detect, ELD and IEC958 switches; on the HDA boxes
+# it is the same story. `amixer set Master` has nothing to move, so volume
+# has to be applied in software. That is what the softvol plugin below is
+# for -- it invents a mixer control and scales the samples on the way past.
+#
+# The device number is never fixed. HDMI playback is device 3/7/8 on Intel
+# HDA and device 0/1/2 on the Pipo's LPE Audio, so anything that assumes
+# "card 0 device 0" is silent on both. Always enumerate.
+set -eu
+
+TONE=/usr/local/share/steadyscreen/tone.py
+TONE_WAV=/var/lib/kiosk/tone.wav
+CONF="${KIOSK_ASOUND_CONF:-/etc/asound.conf}"
+STATE="${KIOSK_AUDIO_STATE:-/var/lib/kiosk/audio.state}"
+CTL_NAME="SteadyScreen"
+MUTEFLAG="$(dirname "$STATE")/audio.mute"
+
+mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
+
+# --------------------------------------------------------------------------
+# Enumeration
+
+# Is this HDMI port actually carrying a display? Three signals, because no
+# single one works everywhere: the jack control is absent on LPE Audio, ELD
+# is all zeroes on the Pipo even when a panel is lit, and the drm connector
+# is the only one that knows about non-HDMI panels.
+hdmi_live() {
+    card=$1; dev=$2
+    j=$(amixer -c "$card" cget "name=HDMI/DP,pcm=$dev Jack" 2>/dev/null \
+        | sed -n 's/.*values=//p' | tail -1)
+    [ "$j" = "on" ] && { echo yes; return; }
+    e=$(amixer -c "$card" cget "numid=$(eld_numid "$card" "$dev")" 2>/dev/null \
+        | sed -n 's/.*values=//p' | tail -1 | tr -d '0x,' | tr -d '0')
+    [ -n "$e" ] && { echo yes; return; }
+    echo no
+}
+
+# ALSA leaves ",device=0" off the control name for the first device, so a
+# pattern that always expects it finds nothing on device 0.
+eld_numid() {
+    if [ "$2" = 0 ]; then
+        amixer -c "$1" controls 2>/dev/null \
+            | sed -n "s/^numid=\([0-9]*\),iface=PCM,name='ELD'\$/\1/p" \
+            | head -1
+    else
+        amixer -c "$1" controls 2>/dev/null \
+            | sed -n "s/^numid=\([0-9]*\),iface=PCM,name='ELD',device=$2\$/\1/p" \
+            | head -1
+    fi
+}
+
+classify() {
+    case "$1" in
+        *HDMI*|*hdmi*|*DP*|*Lpe*|*LPE*) echo hdmi ;;
+        *USB*|*usb*)                    echo usb ;;
+        *)                              echo analog ;;
+    esac
+}
+
+list_outputs() {
+    aplay -l 2>/dev/null | sed -n 's/^card \([0-9]*\): \([^ ]*\) \[\([^]]*\)\], device \([0-9]*\): \([^[]*\)\[\([^]]*\)\].*/\1|\2|\3|\4|\5|\6/p' \
+    | while IFS='|' read -r card cid cname dev dname label; do
+        kind=$(classify "$cname $dname")
+        live=na
+        [ "$kind" = hdmi ] && live=$(hdmi_live "$card" "$dev")
+        [ "$kind" = usb ] && live=yes
+        [ "$kind" = analog ] && live=yes
+        # The bracketed label is the monitor's own name when the sink has
+        # read an ELD, which is far more useful on screen than "HDMI 0".
+        echo "output card=$card device=$dev kind=$kind live=$live name=$(echo "$cname" | sed 's/ *$//') label=$(echo "$label" | sed 's/ *$//')"
+    done
+}
+
+# Preferred default: a live HDMI port, else any HDMI, else anything at all.
+# HDMI first because these are displays -- the sound is meant to come out of
+# the screen the customer is looking at.
+auto_pick() {
+    all=$(list_outputs)
+    p=$(echo "$all" | grep 'kind=hdmi' | grep 'live=yes' | head -1)
+    [ -z "$p" ] && p=$(echo "$all" | grep 'kind=hdmi' | head -1)
+    [ -z "$p" ] && p=$(echo "$all" | head -1)
+    [ -z "$p" ] && return 1
+    echo "$p" | sed -n 's/.*card=\([0-9]*\) device=\([0-9]*\).*/\1 \2/p'
+}
+
+# --------------------------------------------------------------------------
+# Routing
+
+write_conf() {
+    card=$1; dev=$2
+    # plug           -> resample/convert, so a 44.1k page plays on a 48k HDMI
+    # softvol        -> the volume control the hardware does not provide
+    # dmix           -> two players share the device instead of one getting
+    #                   "device busy"; also lets `test` run while a page plays
+    cat > "$CONF" <<EOF
+# Written by kiosk-audio. Edits are overwritten when the output is changed.
+pcm.!default {
+    type plug
+    slave.pcm "ss_soft"
+}
+
+ctl.!default {
+    type hw
+    card $card
+}
+
+pcm.ss_soft {
+    type softvol
+    slave.pcm "ss_dmix"
+    control { name "$CTL_NAME" card $card }
+    min_dB -51.0
+    max_dB 0.0
+}
+
+pcm.ss_dmix {
+    type dmix
+    ipc_key 2048
+    ipc_perm 0666
+    slave {
+        pcm "hw:$card,$dev"
+        rate 48000
+        format S16_LE
+        channels 2
+    }
+}
+EOF
+    echo "$card $dev" > "$STATE"
+}
+
+# softvol only creates its mixer control when the PCM is first opened, so a
+# volume set straight after a routing change would fail with "no such
+# control". Opening the device for a moment of silence brings it into being.
+ensure_ctl() {
+    amixer -c "$(cur_card)" sget "$CTL_NAME" >/dev/null 2>&1 && return 0
+    dd if=/dev/zero bs=4096 count=8 2>/dev/null \
+        | aplay -q -D default -f S16_LE -r 48000 -c 2 - >/dev/null 2>&1 || true
+    amixer -c "$(cur_card)" sget "$CTL_NAME" >/dev/null 2>&1
+}
+
+cur_card() { [ -f "$STATE" ] && cut -d' ' -f1 "$STATE" || echo 0; }
+cur_dev()  { [ -f "$STATE" ] && cut -d' ' -f2 "$STATE" || echo 0; }
+
+# --------------------------------------------------------------------------
+
+case "${1:-status}" in
+auto)
+    auto_pick || { echo "no audio output found" >&2; exit 1; }
+    ;;
+
+list)
+    list_outputs
+    ;;
+
+status)
+    c=$(cur_card); d=$(cur_dev)
+    echo "card=$c"
+    echo "device=$d"
+    [ -f "$CONF" ] && echo "routed=yes" || echo "routed=no"
+    if ensure_ctl 2>/dev/null; then
+        v=$(amixer -c "$c" sget "$CTL_NAME" 2>/dev/null \
+            | sed -n 's/.*\[\([0-9]*\)%\].*/\1/p' | head -1)
+        echo "volume=${v:-0}"
+        echo "control=yes"
+    else
+        echo "volume=0"
+        echo "control=no"
+    fi
+    [ -f "$MUTEFLAG" ] && echo "muted=yes" || echo "muted=no"
+    list_outputs
+    ;;
+
+set-output)
+    if [ "${2:-auto}" = "auto" ]; then
+        set -- set-output $(auto_pick) || { echo "no audio output found" >&2; exit 1; }
+    fi
+    card=${2:?card}; dev=${3:?device}
+    case "$card$dev" in *[!0-9]*) echo "bad card/device" >&2; exit 1 ;; esac
+    aplay -l 2>/dev/null | grep -q "^card $card:.*device $dev:" \
+        || { echo "no such output: card $card device $dev" >&2; exit 1; }
+    write_conf "$card" "$dev"
+    ensure_ctl || true
+    echo "routed to card $card device $dev"
+    ;;
+
+volume)
+    v=${2:?level}
+    case "$v" in *[!0-9]*) echo "bad level" >&2; exit 1 ;; esac
+    [ "$v" -gt 100 ] && v=100
+    [ -f "$CONF" ] || write_conf $(auto_pick)
+    ensure_ctl || { echo "no volume control (nothing has played yet)" >&2; exit 1; }
+    amixer -c "$(cur_card)" sset "$CTL_NAME" "$v%" >/dev/null 2>&1
+    echo "volume $v"
+    ;;
+
+mute)
+    case "${2:-}" in
+    on)  touch "$MUTEFLAG"
+         ensure_ctl && amixer -c "$(cur_card)" sset "$CTL_NAME" 0% >/dev/null 2>&1
+         echo "muted" ;;
+    off) rm -f "$MUTEFLAG"
+         echo "unmuted" ;;
+    *)   echo "usage: kiosk-audio mute on|off" >&2; exit 1 ;;
+    esac
+    ;;
+
+test)
+    [ -f "$CONF" ] || write_conf $(auto_pick)
+    # The 20 s ceiling is for the speaker-test fallback, which runs about six
+    # seconds regardless of -b because dmix picks its own buffer size. The
+    # rendered tone plays in under two.
+    # The point of this is to prove the output works, so the nicer tone is
+    # never allowed to make the test less reliable: if anything about it
+    # fails, fall through to the plain sine that has always worked.
+    # Render to a file, never pipe. Generating the samples in pure python is
+    # slower than realtime on these CPUs, so streaming it starved the sound
+    # card -- aplay reported underruns, exited non-zero, and a perfectly good
+    # output looked like a failure. Rendered once and cached on /data, so only
+    # the first test pays for it.
+    played=no
+    if [ -f "$TONE" ] && command -v aplay >/dev/null 2>&1; then
+        if [ ! -s "$TONE_WAV" ] || [ "$TONE" -nt "$TONE_WAV" ]; then
+            mkdir -p "$(dirname "$TONE_WAV")" 2>/dev/null
+            if python3 "$TONE" > "$TONE_WAV.tmp" 2>/dev/null; then
+                mv -f "$TONE_WAV.tmp" "$TONE_WAV"
+            else
+                rm -f "$TONE_WAV.tmp"
+            fi
+        fi
+        if [ -s "$TONE_WAV" ] \
+           && timeout 20 aplay -q -D default "$TONE_WAV" >/dev/null 2>&1; then
+            played=yes
+        fi
+    fi
+    if [ "$played" = yes ]; then
+        echo "tone played on card $(cur_card) device $(cur_dev)"
+    elif timeout 20 speaker-test -D default -c 2 -t sine -f 440 -l 1 >/dev/null 2>&1; then
+        echo "tone played on card $(cur_card) device $(cur_dev) (plain sine)"
+    else
+        echo "the output did not accept audio (card $(cur_card) device $(cur_dev))" >&2
+        exit 1
+    fi
+    ;;
+
+*)
+    echo "usage: kiosk-audio {list|status|set-output|volume|mute|test}" >&2
+    exit 1 ;;
+esac

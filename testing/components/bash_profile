@@ -1,0 +1,21 @@
+# Start the kiosk session automatically on the autologin console, but only
+# there, so an ssh login or another VT gives you a plain shell to work in.
+#
+# tty2, not tty1: agetty prints "<user> (automatic login)" and cannot be told
+# not to, so the autologin lives on a console nobody sees. X is still started
+# on vt1, taking over directly from the splash plymouth left there -- which is
+# what makes the boot one continuous image instead of a line of text over it.
+#
+# Skipped entirely when booted from the installer stick (/run/live/medium
+# exists): that boot is for installing, not for showing a page.
+# tty1 OR tty2 on purpose. This file lives on /data and therefore survives an
+# OS update, so a new slot whose getty is on tty2 would find a tty1-only
+# profile here and never start X -- a machine that boots, answers ssh, and
+# shows nothing. Accepting both makes the two independent of each other.
+case "$(tty)" in
+    /dev/tty1|/dev/tty2) on_console=yes ;;
+    *) on_console=no ;;
+esac
+if [ -z "$DISPLAY" ] && [ "$on_console" = yes ] && [ ! -d /run/live/medium ]; then
+    exec startx -- vt1 -nolisten tcp -keeptty > "$HOME/.xsession-errors" 2>&1
+fi

@@ -1,0 +1,43 @@
+#!/bin/sh
+# Set this client's friendly name. Metadata only.
+#
+#   kiosk-set-name "Firewheel menu board, left"
+#
+# The HOSTNAME IS NOT TOUCHED, deliberately. It is ds-<fingerprint>, derived
+# from the hardware at install, and it stays put for the life of the machine.
+# That is what makes renaming safe: an X magic cookie is keyed to the hostname,
+# so changing it under a running session used to lock the session out of its
+# own display and the browser could never restart (hazard 7). A friendly name
+# is just a label, so there is nothing to break and no session to repair.
+#
+# The client's id is not changed either -- a server tracks the id, never the
+# name.
+set -e
+[ "$(id -u)" = 0 ] || { echo "run me with sudo" >&2; exit 1; }
+
+NEW=$(printf '%s' "${1:-}" | tr -d '\\"' | cut -c1-64)
+[ -n "$NEW" ] || { echo 'usage: kiosk-set-name "<friendly name>"' >&2; exit 1; }
+
+IDF=/etc/kiosk/identity.json
+ID=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$IDF" 2>/dev/null)
+[ -n "$ID" ] || ID=$(cat /proc/sys/kernel/random/uuid)
+OLD=$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$IDF" 2>/dev/null)
+CREATED=$(sed -n 's/.*"created"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$IDF" 2>/dev/null)
+
+tmp=$(mktemp /etc/kiosk/identity.json.XXXXXX)
+cat > "$tmp" <<JSON
+{
+  "id": "$ID",
+  "name": "$NEW",
+  "created": "$CREATED",
+  "renamed": "$(date -Is)",
+  "hardware": {
+    "emmc_cid": "$(cat /sys/block/mmcblk0/device/cid 2>/dev/null)"
+  }
+}
+JSON
+chown kiosk:kiosk "$tmp"; chmod 644 "$tmp"
+mv "$tmp" "$IDF"
+
+echo "name: ${OLD:-none} -> $NEW"
+echo "hostname unchanged: $(cat /etc/hostname 2>/dev/null)  (id $ID unchanged)"
