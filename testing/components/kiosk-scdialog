@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""Dismiss the modal dialogs the ScreenConnect agent puts on a kiosk screen.
+
+The ScreenConnect Linux agent pops a Swing message box whenever the host asks
+for something its Linux client cannot do:
+
+    Operation 'WAKE_LOCK_ACQUIRED' not supported.     <- every connection
+    Operation 'INPUT_BLOCKED' not supported.          <- "block remote input"
+    Operation 'MONITOR_BLANKED' not supported.        <- "blank remote screen"
+
+On a display that is exactly the wrong thing to do. The dialog is modal, it
+sits on top of whatever the shop is showing customers, and there is nobody
+standing at a menu board to press OK -- so it stays there until somebody
+drives out. The wake-lock one needs no provocation at all: it arrives on every
+single connection.
+
+WHY THIS CANNOT BE FIXED BY ENABLING THE FEATURES
+-------------------------------------------------
+It was worth checking, because "make the operation work" beats "hide the
+complaint". It is not possible. Disassembled from the shipped agent
+(ScreenConnect.Client.jar / ScreenConnect.Core.jar):
+
+    OSToolkit.canAcquireWakeLock()             -> return false
+    ClientOSToolkit.isBlankingMonitorsSupported() -> return false
+
+Both are a hardcoded `return false` on the base class, overridden to true only
+by the macOS toolkit. INPUT_BLOCKED is not even probed -- the constructor does
+EnumSet.of(INPUT_BLOCKED) unconditionally. There is no capability to satisfy,
+no library to install and no client setting that changes any of it. On Linux
+these three are permanently unsupported, and the agent will complain about
+them for as long as it is installed.
+
+Nor can it be fixed by patching the jar: it is signed (META-INF/CWCONTRO.RSA),
+and the agent updates itself from the server, so a patch would be undone
+without warning on somebody else's schedule.
+
+WHAT THIS DOES
+--------------
+Watches the X server for the dialog and closes it. The message is a two-
+argument JOptionPane.showMessageDialog(null, text), which is why the window is
+titled "Message" -- that is Swing's default title, and matching it is what
+makes this narrow rather than a general dialog killer.
+
+It closes by sending WM_DELETE_WINDOW, NOT by destroying the window. That
+matters: the dialog is modal, so the agent's UI thread is blocked inside
+showMessageDialog until it is dismissed properly. Destroying the window would
+take the dialog off the screen while leaving that thread blocked for ever.
+Proven on a test kiosk: after WM_DELETE_WINDOW the window is gone and the
+agent process is still running normally.
+
+WHAT IT DOES NOT DO
+-------------------
+It does not pretend the operation succeeded. Blanking the screen and blocking
+input still do not work, and after this the technician sees nothing happen
+rather than an error -- so every dismissal is RECORDED, in the journal and in
+a state file kiosk-diag reads. Hiding the message without keeping the evidence
+would be the same silent-success fault this project keeps finding in itself.
+
+No new packages. ctypes against libX11, which is present because X is running.
+Adding xdotool or python3-xlib would have meant a new OS image and an OS
+update across the fleet to delete a dialog box.
+"""
+
+import ctypes
+import ctypes.util
+import fcntl
+import json
+import os
+import select
+import sys
+import time
+
+# Swing's default title for the two-argument showMessageDialog. The agent uses
+# that form, so this is the title -- not a guess.
+DIALOG_TITLES = ("Message",)
+
+# Only dialogs belonging to the remote-access agent are touched.
+OWNER_HINTS = ("connectwisecontrol", "screenconnect")
+
+def _state_path():
+    """Somewhere this process can actually write.
+
+    /run belongs to root and this runs as the kiosk user, so the first
+    version wrote nothing at all -- and said nothing about it, because the
+    write was wrapped in a bare `except OSError: pass`. The dismissals were
+    happening and the count stayed at zero, which is the same
+    reports-success-while-doing-nothing fault this watcher exists to log.
+
+    XDG_RUNTIME_DIR is 0700 and owned by the kiosk user; /tmp is the fallback
+    and is a tmpfs, so either way the count is honestly "since boot".
+    """
+    run = os.environ.get("XDG_RUNTIME_DIR")
+    if run and os.path.isdir(run) and os.access(run, os.W_OK):
+        return os.path.join(run, "kiosk-scdialog.json")
+    return "/tmp/kiosk-scdialog.json"
+
+
+STATE = _state_path()
+# When a window appears, look at once and then a few more times.
+#
+# It used to be a single 0.25s wait, on the theory that the name might not be
+# set yet. ICCCM says a client sets its properties BEFORE mapping and Swing
+# does, so that wait was spent on nothing in the ordinary case and the dialog
+# was visible for about a second. Looking immediately catches it; the later
+# looks are there for a toolkit that names its window late, and cost a tree
+# walk each.
+RESCAN_STEPS = (0.0, 0.05, 0.15, 0.4)
+BACKSTOP_SECONDS = 15.0      # a sweep even if no event ever arrives
+
+SubstructureNotifyMask = 1 << 19
+ClientMessage = 33
+
+
+class XTextProperty(ctypes.Structure):
+    # value is a void* on purpose: it is Xlib-allocated and must be handed
+    # back to XFree. As a c_char_p ctypes copies it to bytes and loses the
+    # pointer, and freeing anything else here corrupts the heap.
+    _fields_ = [("value", ctypes.c_void_p), ("encoding", ctypes.c_ulong),
+                ("format", ctypes.c_int), ("nitems", ctypes.c_ulong)]
+
+
+class XClientMessageEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+                ("send_event", ctypes.c_int), ("display", ctypes.c_void_p),
+                ("window", ctypes.c_ulong), ("message_type", ctypes.c_ulong),
+                ("format", ctypes.c_int),
+                ("l0", ctypes.c_long), ("l1", ctypes.c_long),
+                ("l2", ctypes.c_long), ("l3", ctypes.c_long),
+                ("l4", ctypes.c_long)]
+
+
+class XEvent(ctypes.Union):
+    # An XEvent is a union padded out to 24 longs. Anything smaller and
+    # XNextEvent writes past the end of our buffer.
+    _fields_ = [("type", ctypes.c_int), ("cm", XClientMessageEvent),
+                ("pad", ctypes.c_long * 24)]
+
+
+class XErrorEvent(ctypes.Structure):
+    # resourceid comes BEFORE serial. Getting that order wrong reads the
+    # error code out of the middle of a pointer and reports nonsense.
+    _fields_ = [("type", ctypes.c_int), ("display", ctypes.c_void_p),
+                ("resourceid", ctypes.c_ulong), ("serial", ctypes.c_ulong),
+                ("error_code", ctypes.c_ubyte),
+                ("request_code", ctypes.c_ubyte),
+                ("minor_code", ctypes.c_ubyte)]
+
+
+XErrorHandler = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                                 ctypes.POINTER(XErrorEvent))
+
+BadWindow = 3
+BadMatch = 8
+BadDrawable = 9
+# Errors that mean "the window went away between asking and looking", which is
+# not a fault: it is the normal outcome of walking a tree that other processes
+# are changing. Everything else is logged once so a real bug still surfaces.
+RACE_ERRORS = (BadWindow, BadMatch, BadDrawable)
+
+
+def log(msg):
+    sys.stderr.write("kiosk-scdialog: %s\n" % msg)
+    sys.stderr.flush()
+
+
+class X:
+    def __init__(self):
+        path = ctypes.util.find_library("X11")
+        if not path:
+            raise RuntimeError("libX11 not found")
+        self.lib = ctypes.CDLL(path)
+        self.lib.XOpenDisplay.restype = ctypes.c_void_p
+        self.lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self.lib.XDefaultRootWindow.restype = ctypes.c_ulong
+        self.lib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        self.lib.XInternAtom.restype = ctypes.c_ulong
+        self.lib.XConnectionNumber.argtypes = [ctypes.c_void_p]
+        # WITHOUT THIS THE PROCESS DIES ON A RACE IT CANNOT AVOID.
+        #
+        # Xlib's default error handler prints the request and calls exit(1).
+        # windows() walks the tree with XQueryTree, and any window may be
+        # destroyed between its parent being enumerated and it being asked
+        # about -- most often the dialog this program has just closed, which
+        # makes the crash likeliest at exactly the moment it succeeds.
+        #
+        # Seen on FF04's replacement Pipo, 2026-09-09, in .xsession-errors:
+        #     dismissing agent dialog 'Message' (window 0x00800025, pid 3110)
+        #     X Error of failed request:  BadWindow (invalid Window parameter)
+        #     Major opcode of failed request:  15 (X_QueryTree)
+        # It dismissed one dialog and died, and every dialog after that stayed
+        # up. Under kiosk-session it is supervised and comes back in 5s; when
+        # the updater starts it, it is not, so it stayed dead.
+        #
+        # Returning 0 makes the failed call return an error instead of killing
+        # us, and every caller here already handles that: XQueryTree returns 0
+        # and windows() simply does not descend.
+        #
+        # The reference is kept on self DELIBERATELY. A CFUNCTYPE object that
+        # goes out of scope is garbage-collected, and X then calls into freed
+        # memory -- a crash that looks nothing like its cause.
+        self._errors_seen = set()
+        self._error_handler = XErrorHandler(self._on_x_error)
+        self.lib.XSetErrorHandler(self._error_handler)
+
+        self.d = self.lib.XOpenDisplay(None)
+        if not self.d:
+            raise RuntimeError("cannot open DISPLAY=%s"
+                               % os.environ.get("DISPLAY", "<unset>"))
+        self.root = self.lib.XDefaultRootWindow(ctypes.c_void_p(self.d))
+        self.WM_PROTOCOLS = self.lib.XInternAtom(
+            ctypes.c_void_p(self.d), b"WM_PROTOCOLS", 0)
+        self.WM_DELETE = self.lib.XInternAtom(
+            ctypes.c_void_p(self.d), b"WM_DELETE_WINDOW", 0)
+        # only_if_exists=False, and that is the whole point.
+        #
+        # This started life as True, which looks like the careful choice and
+        # is a startup-order bug: the watcher starts at boot, BEFORE any
+        # window has ever set _NET_WM_PID, so the atom does not exist yet and
+        # XInternAtom returns None -- permanently, because it is interned
+        # once. Every owner check then saw pid None, refused to touch the
+        # window, and the dialogs stayed up.
+        #
+        # It passed every test by hand, because a shell that connects after
+        # the desktop is up always finds the atom already there. Interning an
+        # atom that does not exist yet simply creates it, and costs nothing.
+        self.NET_WM_PID = self.lib.XInternAtom(
+            ctypes.c_void_p(self.d), b"_NET_WM_PID", 0)
+        self.fd = self.lib.XConnectionNumber(ctypes.c_void_p(self.d))
+
+    def _on_x_error(self, display, event):
+        try:
+            code = event.contents.error_code
+            if code not in RACE_ERRORS and code not in self._errors_seen:
+                self._errors_seen.add(code)
+                log("ignoring X error code %d (request %d) -- continuing"
+                    % (code, event.contents.request_code))
+        except Exception:                                     # noqa: BLE001
+            pass
+        return 0
+
+    def listen(self):
+        self.lib.XSelectInput(ctypes.c_void_p(self.d),
+                              ctypes.c_ulong(self.root),
+                              ctypes.c_long(SubstructureNotifyMask))
+        self.lib.XFlush(ctypes.c_void_p(self.d))
+
+    def name(self, w):
+        tp = XTextProperty()
+        try:
+            if self.lib.XGetWMName(ctypes.c_void_p(self.d), ctypes.c_ulong(w),
+                                   ctypes.byref(tp)) and tp.value:
+                out = ctypes.string_at(tp.value).decode("utf-8", "replace")
+                self.lib.XFree(ctypes.c_void_p(tp.value))
+                return out
+        except Exception:                                     # noqa: BLE001
+            pass
+        return None
+
+    def pid(self, w):
+        if not self.NET_WM_PID:
+            return None
+        at = ctypes.c_ulong(); af = ctypes.c_int()
+        n = ctypes.c_ulong(); rem = ctypes.c_ulong()
+        p = ctypes.POINTER(ctypes.c_ubyte)()
+        rc = self.lib.XGetWindowProperty(
+            ctypes.c_void_p(self.d), ctypes.c_ulong(w),
+            ctypes.c_ulong(self.NET_WM_PID), 0, 1, 0, 0,
+            ctypes.byref(at), ctypes.byref(af), ctypes.byref(n),
+            ctypes.byref(rem), ctypes.byref(p))
+        if rc == 0 and n.value:
+            v = ctypes.cast(p, ctypes.POINTER(ctypes.c_ulong))[0]
+            self.lib.XFree(p)
+            return int(v)
+        return None
+
+    def windows(self, w=None, out=None, depth=0):
+        out = [] if out is None else out
+        if depth > 6:
+            return out
+        w = self.root if w is None else w
+        r = ctypes.c_ulong(); par = ctypes.c_ulong()
+        ch = ctypes.POINTER(ctypes.c_ulong)(); n = ctypes.c_uint()
+        if self.lib.XQueryTree(ctypes.c_void_p(self.d), ctypes.c_ulong(w),
+                               ctypes.byref(r), ctypes.byref(par),
+                               ctypes.byref(ch), ctypes.byref(n)):
+            for i in range(n.value):
+                out.append(ch[i])
+                self.windows(ch[i], out, depth + 1)
+            if ch:
+                self.lib.XFree(ch)
+        return out
+
+    def close_window(self, w):
+        ev = XEvent()
+        ev.cm.type = ClientMessage
+        ev.cm.send_event = 1
+        ev.cm.display = self.d
+        ev.cm.window = w
+        ev.cm.message_type = self.WM_PROTOCOLS
+        ev.cm.format = 32
+        ev.cm.l0 = self.WM_DELETE
+        ev.cm.l1 = 0
+        self.lib.XSendEvent(ctypes.c_void_p(self.d), ctypes.c_ulong(w),
+                            0, 0, ctypes.byref(ev))
+        self.lib.XFlush(ctypes.c_void_p(self.d))
+
+    def drain(self):
+        """Read every queued event. Returns True if any arrived."""
+        got = False
+        ev = XEvent()
+        while self.lib.XPending(ctypes.c_void_p(self.d)) > 0:
+            self.lib.XNextEvent(ctypes.c_void_p(self.d), ctypes.byref(ev))
+            got = True
+        return got
+
+
+def cmdline_is_agent(cmd):
+    """True when this command line is the ScreenConnect agent.
+
+    Split out from the /proc read so it can be tested without a live agent
+    and a live X server, which is most of why the owner check was worth
+    having a test for at all.
+    """
+    if not cmd:
+        return False
+    return any(h in cmd.lower() for h in OWNER_HINTS)
+
+
+def owner_is_agent(pid):
+    """True when the window belongs to the ScreenConnect agent.
+
+    Without this the watcher would be a general-purpose dialog killer, which
+    is a much larger promise than the one being made here. A window we cannot
+    attribute is left alone: the failure that matters is closing somebody
+    else's dialog, not leaving one of the agent's up for an extra moment.
+    """
+    if not pid:
+        return False
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            cmd = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    return cmdline_is_agent(cmd)
+
+
+def record(state, title, pid):
+    state["dismissed"] = state.get("dismissed", 0) + 1
+    state["last"] = {"title": title, "pid": pid, "at": int(time.time())}
+    tmp = STATE + ".new"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(state, fh)
+        os.replace(tmp, STATE)
+    except OSError as exc:
+        # Said out loud, once. A dismissal that is not recorded is a dialog
+        # that was taken off a customer's screen with no trace, and the whole
+        # justification for closing it at all is that the evidence is kept.
+        if not state.get("warned"):
+            state["warned"] = True
+            log("cannot write %s: %s -- dismissals will not be counted"
+                % (STATE, exc))
+
+
+def sweep(x, state):
+    for w in x.windows():
+        title = x.name(w)
+        if title not in DIALOG_TITLES:
+            continue
+        pid = x.pid(w)
+        if not owner_is_agent(pid):
+            # Deliberately noisy: a "Message" dialog we did NOT recognise is
+            # worth knowing about, precisely because we are not closing it.
+            log("left alone: %r (pid %s is not the agent)" % (title, pid))
+            continue
+        log("dismissing agent dialog %r (window 0x%08x, pid %s)"
+            % (title, w, pid))
+        x.close_window(w)
+        record(state, title, pid)
+
+
+def take_lock():
+    """Only one watcher, whoever started it.
+
+    Two things start this: kiosk-session's supervised loop at boot, and
+    repair_scdialog after an update. They agree by checking whether one is
+    already running, which is a race with a five-second window -- kill the
+    watcher and run an update inside that window and you get two, as happened
+    on the test kiosk on 2026-09-05.
+
+    Two watchers are harmless in effect (the second finds the dialog already
+    gone) but it is a race, and a race that is tolerated because its symptom
+    is mild is one that surprises somebody later. An exclusive lock settles it
+    wherever the process was started from, and needs no agreement between the
+    two callers.
+
+    The handle is deliberately never closed: the lock lives as long as the
+    process, and releasing it is the kernel's job when we exit.
+    """
+    path = os.path.join(os.path.dirname(STATE), ".kiosk-scdialog.lock")
+    try:
+        fh = open(path, "w")
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return None
+    return fh
+
+
+def main():
+    if not os.environ.get("DISPLAY"):
+        os.environ["DISPLAY"] = ":0"
+
+    lock = take_lock()
+    if lock is None:
+        log("another watcher already holds the lock; nothing to do")
+        return 0
+    try:
+        x = X()
+    except Exception as exc:                                  # noqa: BLE001
+        log("not starting: %s" % exc)
+        return 1
+    x.listen()
+    state = {"dismissed": 0, "started": int(time.time())}
+    log("watching %s for agent dialogs %s"
+        % (os.environ["DISPLAY"], ", ".join(repr(t) for t in DIALOG_TITLES)))
+    sweep(x, state)                      # one may already be on screen
+    last_sweep = time.time()
+    pending = []
+    while True:
+        now = time.time()
+
+        # Anything due, including the immediate look after a map.
+        if pending and pending[0] <= now:
+            pending.pop(0)
+            sweep(x, state)
+            last_sweep = time.time()
+            continue
+
+        # The backstop is measured from the last sweep, not from the last
+        # event. The first version only reached it when no event had arrived,
+        # so a display with steady window activity could have starved it.
+        if now - last_sweep >= BACKSTOP_SECONDS:
+            sweep(x, state)
+            last_sweep = time.time()
+            continue
+
+        timeout = (pending[0] - now) if pending \
+            else (last_sweep + BACKSTOP_SECONDS - now)
+        try:
+            select.select([x.fd], [], [], max(0.0, timeout))
+        except (OSError, ValueError) as exc:
+            log("display went away: %s" % exc)
+            return 1
+        if x.drain():
+            base = time.time()
+            pending = sorted(set(pending + [base + s for s in RESCAN_STEPS]))
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
