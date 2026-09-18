@@ -1,0 +1,180 @@
+#!/usr/bin/python3
+"""The one place a hardware fingerprint is computed.
+
+The installer and the client must agree exactly about what machine this is.
+Twice they did not, because each had its own implementation:
+
+  * the first pair disagreed over MAC filtering, and a client re-derived a new
+    id at every boot;
+  * the second pair agreed with each other perfectly and were both wrong,
+    because the value they agreed on was not unique between two machines.
+
+So there is one program now and both call it. Two implementations cannot
+drift if there is only one.
+
+What goes in, and why:
+
+  permanent NIC addresses -- read with ETHTOOL_GPERMADDR, which returns the
+    address burned into the card. NetworkManager randomises the *current* wifi
+    MAC while scanning, which is what made an earlier fingerprint change on
+    every boot; the permanent address is untouched by that. Works unprivileged,
+    so root and the kiosk user get the same answer.
+
+  the disk -- eMMC CID, wwid or serial.
+
+USB network adapters are skipped: a dongle plugged in or pulled out must not
+change what machine this is. So are virtual and locally-administered addresses
+(bridges, veth, docker), which are invented rather than burned in.
+
+On hardware where none of this is unique -- the Pipos share an eMMC CID *and*
+a placeholder SMBIOS UUID -- the NIC addresses are the only thing that
+separates two boxes. That is measured, not assumed: two of them returned
+identical cid, serial, manfid, oemid, date and product_uuid, and differing
+MACs.
+
+    kiosk-hwid                 fingerprint for the disk backing /
+    kiosk-hwid --disk sdb      fingerprint for another disk (the installer's
+                               target, since it runs from a USB stick)
+    kiosk-hwid --parts         show the inputs, for diagnosis
+"""
+import ctypes
+import fcntl
+import glob
+import hashlib
+import os
+import socket
+import struct
+import subprocess
+import sys
+
+SIOCETHTOOL = 0x8946
+ETHTOOL_GPERMADDR = 0x00000020
+HW_BY_ID = ("ata-", "nvme-", "mmc-", "scsi-", "usb-", "wwn-")
+
+
+def permanent_mac(iface):
+    """The address burned into the card, not whatever is set right now."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        buf = ctypes.create_string_buffer(
+            struct.pack("II", ETHTOOL_GPERMADDR, 32) + b"\x00" * 32)
+        ifreq = struct.pack("16sP", iface.encode(), ctypes.addressof(buf))
+        fcntl.ioctl(sock, SIOCETHTOOL, ifreq)
+        size = struct.unpack("II", buf.raw[:8])[1]
+        if not size:
+            return ""
+        return ":".join("%02x" % b for b in buf.raw[8:8 + 6])
+    except Exception:                                         # noqa: BLE001
+        return ""
+    finally:
+        try:
+            sock.close()
+        except Exception:                                     # noqa: BLE001
+            pass
+
+
+def locally_admin(mac):
+    """Invented rather than burned in: bridges, veth, docker, randomised."""
+    try:
+        return bool(int(mac.split(":")[0], 16) & 0x02)
+    except (ValueError, IndexError):
+        return False
+
+
+def macs():
+    out = []
+    for path in sorted(glob.glob("/sys/class/net/*/")):
+        name = os.path.basename(path.rstrip("/"))
+        if name == "lo":
+            continue
+        try:
+            if "usb" in os.path.realpath(os.path.join(path, "device")):
+                continue                       # a dongle is not the machine
+        except Exception:                                     # noqa: BLE001
+            pass
+        mac = permanent_mac(name)
+        if not mac or mac == "00:00:00:00:00:00" or locally_admin(mac):
+            continue
+        out.append("mac=" + mac)
+    return sorted(set(out))
+
+
+def root_disk():
+    try:
+        src = subprocess.run(["findmnt", "-no", "SOURCE", "/"],
+                             capture_output=True, text=True,
+                             timeout=10).stdout.strip()
+        if not src:
+            return ""
+        parent = subprocess.run(["lsblk", "-no", "PKNAME", src],
+                                capture_output=True, text=True,
+                                timeout=10).stdout.strip().splitlines()
+        if parent and parent[0].strip():
+            return parent[0].strip()
+        return os.path.basename(src)
+    except Exception:                                         # noqa: BLE001
+        return ""
+
+
+def disk_identity(disk):
+    disk = os.path.basename(disk or "")
+    if not disk:
+        return ""
+    for key in ("cid", "wwid", "serial"):
+        try:
+            val = open("/sys/block/%s/device/%s" % (disk, key)).read().strip()
+            if val:
+                return "%s=%s" % (key, val)
+        except Exception:                                     # noqa: BLE001
+            pass
+    try:
+        want = os.path.realpath("/dev/" + disk)
+        for link in sorted(glob.glob("/dev/disk/by-id/*")):
+            base = os.path.basename(link)
+            if "part" in base or not base.startswith(HW_BY_ID):
+                continue
+            if os.path.realpath(link) == want:
+                return "byid=" + base
+    except Exception:                                         # noqa: BLE001
+        pass
+    return ""
+
+
+def parts(disk=None):
+    disk = disk or root_disk()
+    out = list(macs())
+    ident = disk_identity(disk)
+    if ident:
+        out.append("disk=" + ident)
+    return out
+
+
+def fingerprint(disk=None):
+    items = parts(disk)
+    if not items:
+        return ""
+    return hashlib.sha256(("\n".join(items) + "\n").encode()).hexdigest()
+
+
+def main():
+    disk = None
+    if "--disk" in sys.argv:
+        try:
+            disk = sys.argv[sys.argv.index("--disk") + 1]
+        except IndexError:
+            print("--disk needs a value", file=sys.stderr)
+            return 2
+    if "--parts" in sys.argv:
+        for p in parts(disk):
+            print(p)
+        return 0
+    fp = fingerprint(disk)
+    if not fp:
+        print("no usable hardware identifier", file=sys.stderr)
+        return 1
+    print(fp)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
