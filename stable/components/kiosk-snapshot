@@ -1,0 +1,345 @@
+#!/bin/bash
+# Snapshot and roll back what lives on /data.
+#
+#   kiosk-snapshot create [stream] [label]   take one
+#   kiosk-snapshot list [stream]             what there is, and what it cost
+#   kiosk-snapshot restore <id>              put it back (reboot after)
+#   kiosk-snapshot delete <id>               remove one
+#   kiosk-snapshot prune [stream]            apply the retention policy
+#
+# TWO INDEPENDENT STREAMS, because config and media have nothing in common
+# except the disk they sit on:
+#
+#   config  settings, network profiles, ssh host keys, the home directory.
+#           A few megabytes. Snapshotted OFTEN -- before every update -- and
+#           kept by count, because the count is what bounds it.
+#   media   stored files and locally hosted web apps. Potentially gigabytes.
+#           Snapshotted only WHEN MEDIA CHANGES, because nothing else can
+#           change it, and kept by SIZE, because a count of large snapshots
+#           is not a bound on anything.
+#
+# One stream with a scope flag was the first design and it is worse: restoring
+# a config-only snapshot would silently leave media as it is, restoring a
+# combined one would silently revert it, and the operator cannot tell which
+# kind they are clicking. Two streams makes the question disappear -- you
+# restore config, or you restore media, and it says so.
+#
+# Hardlink snapshots, not copies: rsync --link-dest points every unchanged
+# file at the previous snapshot's inode in the SAME stream, so a snapshot
+# costs only what changed. Unchanged media is free; churning media is not,
+# which is exactly why it gets its own retention.
+#
+# NOT snapshotted by anything: the journal (churns, no rollback meaning), the
+# swapfile (2 GB of nothing), lost+found, and boot-migration -- that one is
+# already a backup, and snapshotting a backup is how a disk fills up.
+set -uo pipefail
+
+DATA=/data
+SNAPROOT="$DATA/.snapshots"
+STREAMS="config media"
+
+# The media directories do not exist yet -- local file storage and web apps
+# are roadmap. An empty set is not an error: `create media` on a client with
+# no media says so and does nothing, rather than being dead code waiting.
+SETS_config="cups etc-kiosk home-kiosk nm-connections ssh var-lib-kiosk"
+SETS_media="media webapps"
+
+# Five. They are hardlinked against the previous one, so a config snapshot
+# costs almost nothing in space -- but a list of ten on a page is a list
+# nobody reads, and the ones that matter are the recent ones. Older than five
+# and you are not restoring, you are archaeology.
+KEEP_config="${KEEP_CONFIG:-5}"         # bounded by count; each is tiny
+MAX_MEDIA_MB="${MAX_MEDIA_MB:-3000}"    # bounded by size; count means nothing here
+MIN_FREE_MB="${MIN_FREE_MB:-500}"
+
+die()  { echo "$*" >&2; exit 1; }
+say()  { printf '%s\n' "$*"; }
+
+need_root() { [ "$(id -u)" = 0 ] || die "must run as root"; }
+
+# Snapshots taken before the streams were split live directly in
+# $SNAPROOT/<id>, one level above where they are looked for now. Left alone
+# they would simply stop appearing -- a silent loss of exactly the thing
+# somebody keeps snapshots for. Move them into the config stream once; they
+# were all config snapshots, because that is all there was.
+migrate_pre_split() {
+    local d name
+    [ -d "$SNAPROOT" ] || return 0
+    for d in "$SNAPROOT"/*; do
+        [ -d "$d" ] || continue
+        name=$(basename "$d")
+        case "$name" in
+            config|media) continue ;;
+            [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+            *) continue ;;
+        esac
+        mkdir -p "$SNAPROOT/config" || return 0
+        mv "$d" "$SNAPROOT/config/$name" 2>/dev/null \
+            && say "moved pre-split snapshot $name into the config stream" >&2
+    done
+    return 0
+}
+
+valid_stream() { case "${1:-}" in config|media) return 0 ;; *) return 1 ;; esac; }
+sets_for()  { case "$1" in config) echo "$SETS_config" ;; media) echo "$SETS_media" ;; esac; }
+snapdir()   { echo "$SNAPROOT/$1"; }
+
+# Which stream an id belongs to. Ids are made unique across ALL streams at
+# creation time -- see cmd_create. They are timestamps to the second, and two
+# streams CAN be snapshotted in the same second: a restore taken before a
+# media deploy does exactly that. When it happened, `restore <id>` silently
+# picked whichever stream sorted first and the other snapshot became
+# unreachable by id.
+stream_of() {
+    local st
+    for st in $STREAMS; do
+        [ -d "$SNAPROOT/$st/$1" ] && { echo "$st"; return 0; }
+    done
+    return 1
+}
+
+# An id is a stream letter and a timestamp: C-20260830-094902. The letter
+# makes the stream visible wherever an id appears -- a log line, a filename,
+# an operator reading it out over the phone -- and makes a collision between
+# the two streams impossible by construction rather than by timing.
+#
+# The pattern also accepts a bare timestamp, so snapshots taken before the
+# streams were split stay listable and restorable instead of quietly
+# disappearing from the admin page.
+ID_RE='^([CM]-)?[0-9]{8}-[0-9]{6}$'
+
+new_id() {
+    case "$1" in
+        config) printf 'C-%s\n' "$(date +%Y%m%d-%H%M%S)" ;;
+        media)  printf 'M-%s\n' "$(date +%Y%m%d-%H%M%S)" ;;
+        *)      date +%Y%m%d-%H%M%S ;;
+    esac
+}
+
+valid_id() {
+    case "${1:-}" in
+        ''|*/*|*..*) return 1 ;;
+        *) stream_of "$1" >/dev/null ;;
+    esac
+}
+
+ids_in()  { ls -1 "$(snapdir "$1")" 2>/dev/null | grep -E "$ID_RE" | sort; }
+newest()  { ids_in "$1" | tail -1; }
+stream_mb() { du -sm "$(snapdir "$1")" 2>/dev/null | awk '{print $1}'; }
+
+free_mb() { df -Pm "$DATA" | awk 'NR==2{print $4}'; }
+
+cmd_create() {
+    need_root
+    # One snapshot at a time, across every stream. Two concurrent creates
+    # picked the same id -- the uniqueness check ran in both before either
+    # renamed its staging directory into place, so checking was never going
+    # to be enough. They would also race on --link-dest, which points at
+    # "the newest snapshot" and would have moved underneath one of them.
+    #
+    # A lock FD rather than re-exec under `flock <cmd>`: that form needs "$0"
+    # to be executable and on a resolvable path, which is true of the
+    # installed helper and not true of a copy being tested. The kernel drops
+    # this lock when the process exits, however it exits.
+    mkdir -p "$SNAPROOT"
+    exec 9>"$SNAPROOT/.lock" || die "cannot open the snapshot lock"
+    flock 9 || die "cannot take the snapshot lock"
+    local stream label id prev tmp dir sets rc=0 any=0
+    stream="${1:-config}"
+    valid_stream "$stream" || die "stream must be config or media"
+    label="${2:-}"
+    case "$label" in *[!A-Za-z0-9._-]*) die "label may only contain letters, digits, dot, dash, underscore" ;; esac
+
+    sets=$(sets_for "$stream")
+    for setdir in $sets; do [ -d "$DATA/$setdir" ] && any=1; done
+    if [ "$any" = 0 ]; then
+        say "nothing to snapshot in $stream on this client"
+        return 0
+    fi
+
+    dir=$(snapdir "$stream")
+    mkdir -p "$dir" || die "cannot create $dir"
+    [ "$(free_mb)" -ge "$MIN_FREE_MB" ] \
+        || die "only $(free_mb) MB free on $DATA; refusing to add a snapshot"
+
+    # Unique across every stream, not just this one. An id is a timestamp to
+    # the second and a restore snapshots one stream while a deploy snapshots
+    # another, so a collision is a thing that actually happens.
+    id=$(new_id "$stream")
+    while stream_of "$id" >/dev/null 2>&1; do sleep 1; id=$(new_id "$stream"); done
+    prev=$(newest "$stream")
+    # Build under a name that is not a valid id, so an interrupted snapshot is
+    # never mistaken for a complete one -- and rename into place at the end.
+    tmp="$dir/.incomplete-$id"
+    rm -rf "$tmp"; mkdir -p "$tmp" || die "cannot stage in $dir"
+
+    for setdir in $sets; do
+        [ -d "$DATA/$setdir" ] || continue
+        if [ -n "$prev" ] && [ -d "$dir/$prev/$setdir" ]; then
+            rsync -aHAX --delete --link-dest="$dir/$prev/$setdir/" \
+                  "$DATA/$setdir/" "$tmp/$setdir/" || rc=1
+        else
+            rsync -aHAX --delete "$DATA/$setdir/" "$tmp/$setdir/" || rc=1
+        fi
+    done
+    [ $rc -eq 0 ] || { rm -rf "$tmp"; die "snapshot failed; nothing was kept"; }
+
+    printf '{"id":"%s","stream":"%s","label":"%s","created":"%s","software":"%s","os":"%s"}\n' \
+        "$id" "$stream" "$label" "$(date -Is)" \
+        "$(sed -n 's/^VERSION = "\(.*\)"/\1/p' /usr/local/bin/kiosk.py 2>/dev/null | head -1)" \
+        "$(cat /etc/steadyscreen-os-version 2>/dev/null | tr -d ' \t\n')" \
+        > "$tmp/.meta.json"
+
+    mv "$tmp" "$dir/$id" || { rm -rf "$tmp"; die "could not finish the snapshot"; }
+    sync
+    say "$stream snapshot $id${label:+ ($label)}"
+    cmd_prune "$stream" >/dev/null
+}
+
+cmd_list() {
+    local want="${1:-}"
+    [ -n "$want" ] && { valid_stream "$want" || die "stream must be config or media"; }
+    python3 - "$SNAPROOT" "$want" <<'PY'
+import json, os, subprocess, sys
+root, want = sys.argv[1], sys.argv[2]
+out = []
+for stream in ('config', 'media'):
+    if want and stream != want:
+        continue
+    d = os.path.join(root, stream)
+    if not os.path.isdir(d):
+        continue
+    names = [n for n in sorted(os.listdir(d), reverse=True)
+             if os.path.isdir(os.path.join(d, n)) and not n.startswith('.')]
+    for name in names:
+        meta = {}
+        try:
+            with open(os.path.join(d, name, '.meta.json')) as fh:
+                meta = json.load(fh)
+        except Exception:
+            pass
+        out.append({'id': name, 'stream': stream, 'label': meta.get('label', ''),
+                    'created': meta.get('created', ''),
+                    'software': meta.get('software', ''),
+                    'os': meta.get('os') or '0', 'kb': 0})
+    # Size them in ONE du invocation per stream, oldest first. du counts each
+    # inode once per invocation and attributes it to the first path that
+    # references it, so this is what each snapshot costs on top of the ones
+    # before it. One du per snapshot instead -- which this did at first --
+    # counts every hardlinked file again for every snapshot, and reported a
+    # free snapshot as costing the whole set.
+    paths = [os.path.join(d, n) for n in reversed(names)]
+    if paths:
+        try:
+            r = subprocess.run(['du', '-s'] + paths, capture_output=True,
+                               text=True, timeout=120)
+            sizes = {}
+            for line in r.stdout.splitlines():
+                parts = line.split(None, 1)
+                if len(parts) == 2:
+                    sizes[os.path.basename(parts[1].rstrip('/'))] = int(parts[0])
+            for o in out:
+                if o['stream'] == stream:
+                    o['kb'] = sizes.get(o['id'], o['kb'])
+        except Exception:
+            pass
+print(json.dumps(out, indent=2))
+PY
+}
+
+cmd_delete() {
+    need_root
+    local st
+    valid_id "${1:-}" || die "no such snapshot: ${1:-}"
+    st=$(stream_of "$1") || die "no such snapshot: $1"
+    rm -rf "$(snapdir "$st")/$1" || die "could not remove $1"
+    say "deleted $st snapshot $1"
+}
+
+cmd_prune() {
+    need_root
+    local want="${1:-}" st ids n old
+    [ -n "$want" ] && { valid_stream "$want" || die "stream must be config or media"; }
+
+    for st in $STREAMS; do
+        [ -n "$want" ] && [ "$st" != "$want" ] && continue
+        mkdir -p "$(snapdir "$st")"
+
+        if [ "$st" = config ]; then
+            # Bounded by count: each is a few hundred kilobytes, so the number
+            # of them is the only thing worth limiting.
+            ids=$(ids_in "$st"); n=$(printf '%s\n' "$ids" | grep -c .)
+            if [ "$n" -gt "$KEEP_config" ] && [ "$KEEP_config" -ge 1 ]; then
+                printf '%s\n' "$ids" | head -n $(( n - KEEP_config )) | while read -r old; do
+                    [ -n "$old" ] && rm -rf "$(snapdir "$st")/$old" && say "pruned config $old"
+                done
+            fi
+        else
+            # Bounded by SIZE. A count means nothing when one changed video is
+            # a whole extra copy: ten snapshots could be 200 MB or 20 GB.
+            while [ "$(stream_mb "$st")" -gt "$MAX_MEDIA_MB" ]; do
+                ids=$(ids_in "$st"); n=$(printf '%s\n' "$ids" | grep -c .)
+                [ "$n" -le 1 ] && break
+                old=$(printf '%s\n' "$ids" | head -1)
+                rm -rf "$(snapdir "$st")/$old" && say "pruned media $old (over $MAX_MEDIA_MB MB)"
+            done
+        fi
+    done
+
+    # A backstop across both, media first because that is where the bytes are.
+    # A display that cannot write because its snapshots filled the disk is a
+    # worse outcome than one with no history.
+    while [ "$(free_mb)" -lt "$MIN_FREE_MB" ]; do
+        for st in media config; do
+            ids=$(ids_in "$st"); n=$(printf '%s\n' "$ids" | grep -c .)
+            [ "$n" -le 1 ] && continue
+            old=$(printf '%s\n' "$ids" | head -1)
+            rm -rf "$(snapdir "$st")/$old" && say "pruned $st $old (low space)"
+            continue 2
+        done
+        break
+    done
+    return 0
+}
+
+cmd_restore() {
+    need_root
+    local id st rc=0
+    valid_id "${1:-}" || die "no such snapshot: ${1:-}"
+    id="$1"; st=$(stream_of "$id") || die "no such snapshot: $id"
+
+    # Snapshot the CURRENT state of THIS STREAM first, so a rollback is itself
+    # undoable. The one thing worse than a bad config is discovering the
+    # rollback was worse and having nothing to go back to.
+    cmd_create "$st" "before-restore" >/dev/null || die "could not snapshot the current $st; not restoring"
+
+    for setdir in $(sets_for "$st"); do
+        [ -d "$(snapdir "$st")/$id/$setdir" ] || continue
+        rsync -aHAX --delete "$(snapdir "$st")/$id/$setdir/" "$DATA/$setdir/" || rc=1
+    done
+    sync
+    [ $rc -eq 0 ] || die "restore was incomplete -- REBOOT before changing anything else"
+    say "restored $st snapshot $id"
+    if [ "$st" = config ]; then
+        say "reboot to finish: the running client is still using what it loaded at boot"
+    else
+        say "media is back in place; the page will pick it up on its next load"
+    fi
+}
+
+[ -d "$SNAPROOT" ] && [ -w "$SNAPROOT" ] && migrate_pre_split
+
+case "${1:-}" in
+    create)  shift
+             # `create`, `create config`, `create config <label>` all work, and
+             # so does `create <label>` -- config is what anybody typing this
+             # in a hurry means.
+             if valid_stream "${1:-}"; then st="$1"; shift; else st=config; fi
+             cmd_create "$st" "${1:-}" ;;
+    list)    shift; cmd_list "${1:-}" ;;
+    restore) shift; cmd_restore "${1:-}" ;;
+    delete)  shift; cmd_delete "${1:-}" ;;
+    prune)   shift; cmd_prune "${1:-}" ;;
+    *) echo "usage: kiosk-snapshot {create [config|media] [label]|list [stream]|restore <id>|delete <id>|prune [stream]}" >&2
+       exit 1 ;;
+esac

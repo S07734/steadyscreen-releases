@@ -1,0 +1,40 @@
+<?xml version="1.0" standalone='no'?><!--*-nxml-*-->
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+
+<!--Announce this display on the network.
+
+     Until now the only way to find a display was to sweep the subnet for an
+     open port and ask every answer whether it was a kiosk. That is slow, it
+     depends on guessing the right port, and it finds nothing on a network
+     that is not the one being swept.
+
+     avahi is already installed and running on this image, so this costs one
+     file and no processes. Anything that browses _steadyscreen._tcp gets
+     every display, by name and address, straight away:
+
+         avahi-browse -rt _steadyscreen._tcp
+
+     _http._tcp is advertised as well so the display also turns up in the
+     ordinary "network devices" lists people already have.
+
+     PORT 80 IS ASSERTED HERE. The client serves 80 and only falls back to
+     8080 when an image is too old to bind it — a machine in that state
+     advertises an address that will not answer, which is the correct
+     complaint to raise about a machine that needs attention anyway. -->
+
+<service-group>
+  <name replace-wildcards="yes">SteadyScreen on %h</name>
+
+  <service>
+    <type>_steadyscreen._tcp</type>
+    <port>80</port>
+    <txt-record>path=/</txt-record>
+    <txt-record>admin=/</txt-record>
+  </service>
+
+  <service>
+    <type>_http._tcp</type>
+    <port>80</port>
+    <txt-record>path=/</txt-record>
+  </service>
+</service-group>

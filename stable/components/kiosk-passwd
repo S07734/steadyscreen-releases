@@ -1,0 +1,25 @@
+#!/bin/sh
+# Set the kiosk account's password. Called by the admin page through sudo.
+#
+# The password is read from STDIN, never from the command line: anything in
+# argv is visible in `ps` to every user on the box.
+#
+#   printf '%s' "newsecret" | kiosk-passwd
+set -eu
+[ "$(id -u)" = 0 ] || { echo "must run as root" >&2; exit 1; }
+
+USER_NAME=kiosk
+NEW=$(cat)
+
+# Guard against a stray newline making an unusable password, and against
+# someone locking themselves out with an empty one.
+NEW=$(printf '%s' "$NEW" | tr -d '\r\n')
+if [ ${#NEW} -lt 8 ]; then
+    echo "password must be at least 10 characters" >&2
+    exit 1
+fi
+
+printf '%s:%s\n' "$USER_NAME" "$NEW" | chpasswd
+# A locked account would still refuse the password even once it is set.
+passwd -u "$USER_NAME" >/dev/null 2>&1 || true
+echo "password updated for $USER_NAME"
