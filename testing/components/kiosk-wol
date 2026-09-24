@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Enable Wake-on-LAN (magic packet) on wired NICs that support it.
+
+For displays on hardware WE control -- so a machine that has been powered off
+can be woken with a magic packet from the same LAN. A franchise store we cannot
+reach on the network gets nothing from this (you cannot send a packet to a
+network you are not on); it is for our own fleet, which is why the owner asked
+for it (2026-09-20).
+
+Pure-Python ethtool ioctls, the same approach kiosk-hwid uses to read the
+permanent MAC -- so it needs no `ethtool` binary and works on any image and any
+existing display the component reaches. It DETECTS support and only enables
+where the NIC actually offers magic-packet wake: a NIC that does not (many
+USB-ethernet adapters, every Wi-Fi card) is left alone and recorded as
+not-capable, rather than pretended to work.
+
+WHAT THIS DOES NOT DO, stated so nobody reads more into it than is there: WoL
+also depends on FIRMWARE keeping the NIC powered in the off state and honouring
+the wake -- a per-board BIOS setting this cannot touch and which varies by
+machine. Enabling it here is necessary but not sufficient. `status` records
+what each NIC supports so the fleet can tell which displays are even candidates,
+instead of assuming a setting that may silently do nothing.
+
+  kiosk-wol apply    enable magic-packet WoL on every supporting wired NIC,
+                     idempotent; write the per-NIC state to /run for the admin
+                     page to read
+  kiosk-wol status   print the current per-NIC state as JSON; changes nothing
+
+Root is required -- ethtool WoL get and set are both privileged. kiosk-update
+runs `apply` as root on every pass (which also re-applies it, in case a driver
+reset it across a reboot); the admin page reads the file `apply` leaves behind
+rather than calling the privileged ioctl itself.
+"""
+import ctypes
+import fcntl
+import json
+import os
+import socket
+import struct
+import sys
+
+SIOCETHTOOL  = 0x8946
+ETHTOOL_GWOL = 0x00000005
+ETHTOOL_SWOL = 0x00000006
+WAKE_MAGIC   = 0x20                # ethtool's 'g'
+ARPHRD_ETHER = 1
+
+# struct ethtool_wolinfo { __u32 cmd; __u32 supported; __u32 wolopts;
+#                          __u8 sopass[6]; } -- 18 bytes, sized up to 20.
+WOLINFO_SIZE = 20
+
+STATE_DIR  = "/run/steadyscreen"
+STATE_FILE = STATE_DIR + "/wol.json"
+
+
+def ethernet_ifaces():
+    """Wired NICs only. Wi-Fi is ARPHRD_ETHER too, so it is filtered by its
+    wireless/phy80211 sysfs dir; loopback and virtual types fall out on the
+    type check."""
+    out = []
+    try:
+        names = sorted(os.listdir("/sys/class/net"))
+    except OSError:
+        return out
+    for iface in names:
+        base = "/sys/class/net/" + iface
+        try:
+            with open(base + "/type") as fh:
+                if int(fh.read().strip()) != ARPHRD_ETHER:
+                    continue
+        except (OSError, ValueError):
+            continue
+        if os.path.isdir(base + "/wireless") or os.path.exists(base + "/phy80211"):
+            continue
+        out.append(iface)
+    return out
+
+
+def _ethtool(sock, iface, buf):
+    ifreq = struct.pack("16sP", iface.encode(), ctypes.addressof(buf))
+    fcntl.ioctl(sock, SIOCETHTOOL, ifreq)
+
+
+def get_wol(iface):
+    """(supported_mask, current_wolopts), or (None, None) if it cannot be read."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        buf = ctypes.create_string_buffer(WOLINFO_SIZE)
+        struct.pack_into("I", buf, 0, ETHTOOL_GWOL)
+        _ethtool(sock, iface, buf)
+        supported, wolopts = struct.unpack_from("II", buf, 4)
+        return supported, wolopts
+    except OSError:
+        return None, None
+    finally:
+        sock.close()
+
+
+def set_wol_magic(iface):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        buf = ctypes.create_string_buffer(WOLINFO_SIZE)
+        struct.pack_into("III", buf, 0, ETHTOOL_SWOL, 0, WAKE_MAGIC)
+        _ethtool(sock, iface, buf)
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def mac(iface):
+    """The current address -- the one a magic packet is aimed at."""
+    try:
+        with open("/sys/class/net/%s/address" % iface) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def survey(enable):
+    """Look at every wired NIC; when `enable`, turn magic-packet WoL on where it
+    is supported and not already set. Returns the state, ready to serialise."""
+    nics = []
+    for iface in ethernet_ifaces():
+        supported, wolopts = get_wol(iface)
+        if supported is None:
+            nics.append({"iface": iface, "mac": mac(iface),
+                         "supports_magic": False, "magic_enabled": False,
+                         "note": "wol not queryable"})
+            continue
+        supports = bool(supported & WAKE_MAGIC)
+        enabled = bool(wolopts & WAKE_MAGIC)
+        if enable and supports and not enabled:
+            if set_wol_magic(iface):
+                enabled = True
+        nics.append({"iface": iface, "mac": mac(iface),
+                     "supports_magic": supports, "magic_enabled": enabled})
+    return {"capable": any(n["supports_magic"] for n in nics), "nics": nics}
+
+
+def write_state(state):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(state, fh)
+        os.replace(tmp, STATE_FILE)
+    except OSError:
+        pass
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "apply":
+        state = survey(enable=True)
+        write_state(state)
+        if not state["nics"]:
+            print("no wired NIC found; nothing to enable")
+            return 0
+        for n in state["nics"]:
+            if not n["supports_magic"]:
+                print("    %s (%s): no magic-packet WoL support -- left alone"
+                      % (n["iface"], n["mac"]))
+            elif n["magic_enabled"]:
+                print("    %s (%s): magic-packet WoL on" % (n["iface"], n["mac"]))
+            else:
+                print("    %s (%s): supports WoL but it could not be enabled"
+                      % (n["iface"], n["mac"]), file=sys.stderr)
+        return 0
+    if cmd == "status":
+        print(json.dumps(survey(enable=False)))
+        return 0
+    print("usage: kiosk-wol apply|status", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
