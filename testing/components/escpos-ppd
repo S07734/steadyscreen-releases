@@ -1,0 +1,68 @@
+*PPD-Adobe: "4.3"
+*FormatVersion: "4.3"
+*FileVersion: "1.0"
+*LanguageVersion: English
+*LanguageEncoding: ISOLatin1
+*PCFileName: "SSESCPOS.PPD"
+*Manufacturer: "Generic"
+*Product: "(ESC/POS thermal printer)"
+*ModelName: "SteadyScreen ESC/POS thermal"
+*ShortNickName: "SteadyScreen ESC/POS"
+*NickName: "SteadyScreen ESC/POS thermal printer"
+*PSVersion: "(3010.000) 0"
+*LanguageLevel: "3"
+*ColorDevice: False
+*DefaultColorSpace: Gray
+*FileSystem: False
+*Throughput: "1"
+*LandscapeOrientation: Plus90
+*TTRasterizer: Type42
+*cupsVersion: 2.4
+*cupsModelNumber: 0
+*cupsManualCopies: True
+*cupsFilter: "application/pdf 0 rastertoescpos"
+
+*OpenUI *PageSize/Media Size: PickOne
+*OrderDependency: 10 AnySetup *PageSize
+*DefaultPageSize: X80
+*PageSize X80/80mm roll: "<</PageSize[204 842]/ImagingBBox null>>setpagedevice"
+*PageSize X58/58mm roll: "<</PageSize[136 842]/ImagingBBox null>>setpagedevice"
+*CloseUI: *PageSize
+
+*OpenUI *PageRegion/Media Size: PickOne
+*OrderDependency: 10 AnySetup *PageRegion
+*DefaultPageRegion: X80
+*PageRegion X80/80mm roll: "<</PageSize[204 842]/ImagingBBox null>>setpagedevice"
+*PageRegion X58/58mm roll: "<</PageSize[136 842]/ImagingBBox null>>setpagedevice"
+*CloseUI: *PageRegion
+
+*DefaultImageableArea: X80
+*ImageableArea X80/80mm roll: "0 0 204 842"
+*ImageableArea X58/58mm roll: "0 0 136 842"
+*DefaultPaperDimension: X80
+*PaperDimension X80/80mm roll: "204 842"
+*PaperDimension X58/58mm roll: "136 842"
+
+*OpenUI *Resolution/Resolution: PickOne
+*OrderDependency: 20 AnySetup *Resolution
+*DefaultResolution: 203dpi
+*Resolution 203dpi/203 dpi: "<</HWResolution[203 203]>>setpagedevice"
+*CloseUI: *Resolution
+
+*% Which language the printer actually speaks. A Star TSP100/TSP143 is not an
+*% ESC/POS printer -- it says so itself in its IEEE-1284 id (CMD:STAR) -- and
+*% sent GS v 0 raster it silently discards the job. Per queue, because a
+*% display can have one of each attached, as .94 does.
+*OpenUI *EscposProto/Printer language: PickOne
+*OrderDependency: 10 AnySetup *EscposProto
+*DefaultEscposProto: ESCPOS
+*EscposProto ESCPOS/ESC-POS (Epson and compatible): ""
+*EscposProto Star/Star Line Mode (TSP100, TSP143): ""
+*CloseUI: *EscposProto
+
+*OpenUI *EscposCut/Cut the paper: Boolean
+*OrderDependency: 30 AnySetup *EscposCut
+*DefaultEscposCut: True
+*EscposCut True/Yes: ""
+*EscposCut False/No: ""
+*CloseUI: *EscposCut

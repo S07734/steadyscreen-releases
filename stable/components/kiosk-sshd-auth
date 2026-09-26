@@ -1,0 +1,14 @@
+#!/bin/sh
+# Toggle sshd password authentication. Called by the admin page through
+# sudo; see /etc/sudoers.d/kiosk.
+set -e
+DROPIN=/etc/ssh/sshd_config.d/99-kiosk.conf
+case "$1" in
+  on)  echo "PasswordAuthentication yes" > "$DROPIN" ;;
+  off) echo "PasswordAuthentication no"  > "$DROPIN" ;;
+  *)   echo "usage: kiosk-sshd-auth on|off" >&2; exit 1 ;;
+esac
+chmod 644 "$DROPIN"
+sshd -t                       # refuse to restart into a broken config
+systemctl restart ssh
+echo "password authentication: $1"

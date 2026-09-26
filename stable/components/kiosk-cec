@@ -1,0 +1,244 @@
+#!/bin/sh
+# HDMI-CEC control for the display client, via the kernel CEC API (cec-ctl).
+#
+#   kiosk-cec detect      list adapters, or say why there are none
+#   kiosk-cec on          wake the display and make us the active source
+#   kiosk-cec off         put the display into standby
+#   kiosk-cec scan        what else is on the CEC bus
+#
+# Most x86 machines do NOT wire the CEC pin on their HDMI port -- Intel's
+# driver exposes /dev/cecN on only some chipsets. If `detect` finds nothing,
+# a USB adapter (Pulse-Eight and similar) is the usual answer -- and since
+# 2026-09-11 this script actually attaches one; see attach_pulse8().
+set -eu
+DEV="${KIOSK_CEC_DEV:-}"
+# Roots, overridable only so tests/test-cec.sh can run this against a fake
+# tree. sudo resets the environment, so a caller cannot point the real run
+# anywhere else.
+SYS="${KIOSK_CEC_SYS:-/sys}"
+DEVDIR="${KIOSK_CEC_DEVDIR:-/dev}"
+
+find_dev() {
+    [ -n "$DEV" ] && { echo "$DEV"; return; }
+    attach_pulse8
+    for d in $DEVDIR/cec*; do
+        [ -e "$d" ] || continue
+        set_phys "$d" >/dev/null
+        echo "$d"
+        return
+    done
+    return 1
+}
+
+have_tool() { command -v cec-ctl >/dev/null; }
+
+# A Pulse-Eight USB-CEC adapter is not a /dev/cecN by itself. It enumerates as
+# a serial port (/dev/ttyACMn, USB id 2548:1002), and the kernel's pulse8-cec
+# driver only binds once something attaches that port to the serio layer --
+# which is what `inputattach --pulse8-cec` does, and nothing on this image
+# did. Found on .43, 2026-09-11: the adapter enumerated cleanly, the driver was
+# sitting in the kernel unloaded, and detect said adapters=0 -- while the
+# comment above recommended buying exactly this adapter.
+#
+# The attach must HOLD the port open for as long as the adapter is in use;
+# close it and the CEC device goes away. So the holder runs as a transient
+# systemd unit, never as a child of this script: kiosk.py reads our output
+# through a pipe, and a background child holding that pipe open would stall
+# every call until its timeout. Lazy by design -- attached the first time
+# anything asks for the adapter, and again after a replug, because the holder
+# exits when its port disappears.
+#
+# The holder, in Python because the two ioctls need pointers to an int and an
+# unsigned long: the serial line discipline (N_MOUSE = 2, which is serport),
+# then SPIOCSTYPE with protocol SERIO_PULSE8_CEC (0x40). Values from
+# <linux/tty.h> and <linux/serio.h>; 0x40087101 is _IOW('q', 1, unsigned long)
+# on a 64-bit kernel.
+PULSE8_HOLD='
+import fcntl, os, struct, sys, termios
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_NOCTTY)
+a = termios.tcgetattr(fd)
+a[0] = a[1] = a[3] = 0
+a[2] = termios.CS8 | termios.CREAD | termios.CLOCAL | termios.HUPCL
+a[4] = a[5] = termios.B9600
+a[6][termios.VMIN] = 1
+a[6][termios.VTIME] = 0
+termios.tcsetattr(fd, termios.TCSANOW, a)
+fcntl.ioctl(fd, getattr(termios, "TIOCSETD", 0x5423), struct.pack("i", 2))
+fcntl.ioctl(fd, 0x40087101, struct.pack("L", 0x40))
+while os.read(fd, 1):
+    pass
+'
+
+pulse8_ports() {
+    for t in $SYS/class/tty/ttyACM*; do
+        [ -e "$t" ] || continue
+        [ "$(cat "$t/device/../idVendor" 2>/dev/null)" = 2548 ] || continue
+        basename "$t"
+    done
+}
+
+attach_pulse8() {
+    started=0
+    for tty in $(pulse8_ports); do
+        unit="kiosk-cec-pulse8-$tty"
+        systemctl is-active --quiet "$unit" && continue
+        modprobe -q serport 2>/dev/null || true
+        modprobe -q pulse8-cec 2>/dev/null || true
+        systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+        systemd-run --quiet --collect --unit="$unit" \
+            /usr/bin/python3 -c "$PULSE8_HOLD" "$DEVDIR/$tty" \
+            >/dev/null 2>&1 && started=1
+    done
+    [ "$started" = 1 ] || return 0
+    # The driver handshakes with the adapter before it registers /dev/cecN.
+    i=0
+    while [ "$i" -lt 50 ]; do
+        ls $DEVDIR/cec* >/dev/null 2>&1 && return 0
+        sleep 0.1
+        i=$((i + 1))
+    done
+    return 0
+}
+
+# Whether the TV will actually listen -- a setting on the TV, and the whole
+# problem on .43, 2026-09-11. Its LG acknowledged every message at the bus
+# level and obeyed none, because SimpLink was off. Nothing on our side could
+# tell, and Wake and Standby silently did nothing. Three answers, from two
+# messages:
+#
+#   poll not acknowledged    no TV on the CEC line: off at the wall, a cable
+#                            that does not carry CEC, or nothing there at all
+#   acknowledged, no reply   the TV is there with its HDMI-CEC setting off
+#   a reply                  it is listening, and its power state comes back
+#
+# The probe is <Give Device Power Status>: the LG answered it in about 20 ms.
+# <Give OSD Name> is NOT usable -- it timed out even with SimpLink on, so it
+# would call a working TV broken. A logical address is claimed first, because
+# the LG did not answer a question sent as "Unregistered".
+tv_check() {
+    d="$1"
+    if [ "$(phys_of "$d")" = "f.f.f.f" ]; then
+        echo "tv=unknown why=no-address"
+        return 0
+    fi
+    # Claim a logical address only when there is none. Claiming re-runs the
+    # whole allocation and its broadcasts, and this runs every time the
+    # Display tab opens -- for an address the adapter usually already holds.
+    la=$(cec-ctl -d "$d" -l 2>/dev/null | tail -1)
+    case "$la" in
+        ''|15|*[!0-9]*) cec-ctl -d "$d" --playback >/dev/null 2>&1 || true ;;
+    esac
+    if cec-ctl -d "$d" --to 0 --poll 2>&1 | grep -q "Not Acknowledged"; then
+        echo "tv=absent"
+        return 0
+    fi
+    out=$(cec-ctl -d "$d" --to 0 --give-device-power-status 2>&1 || true)
+    pwr=$(printf '%s\n' "$out" | sed -n 's/^\s*pwr-state: *\([a-z-]*\).*/\1/p' | head -1)
+    if [ -n "$pwr" ]; then
+        echo "tv=answers power=$pwr"
+    elif printf '%s\n' "$out" | grep -q "Rx, Timeout"; then
+        echo "tv=ignoring"
+    else
+        echo "tv=unknown why=no-reply-status"
+    fi
+}
+
+phys_of() {
+    cec-ctl -d "$1" -x 2>/dev/null \
+        | grep -Eo '^[0-9a-f]\.[0-9a-f]\.[0-9a-f]\.[0-9a-f]$' | head -1
+}
+
+# A Pulse-Eight has no HDMI physical address of its own. It sits inline
+# between this machine's HDMI port and the TV, but the kernel does not know
+# which DRM connector that is, so it registers at f.f.f.f -- and at f.f.f.f the
+# CEC framework will not claim a logical address, so every command goes out
+# as "Unregistered". Measured on .43, 2026-09-11: `kiosk-cec on` reported
+# "display woken" from exactly that state.
+#
+# The address is in the TV's EDID, which reaches us THROUGH the adapter, so
+# the connected HDMI connector's EDID carries it -- 1.0.0.0 on .43's LG. Only
+# adapters that come up at f.f.f.f are touched: an i915 CEC device gets its
+# address from DRM already, and overriding it would be wrong. With more than
+# one HDMI connector connected the first is used, which is a guess, and is
+# said so in detect's output.
+set_phys() {
+    d="$1"
+    [ "$(phys_of "$d")" = "f.f.f.f" ] || return 0
+    for c in $SYS/class/drm/card*-HDMI*; do
+        [ "$(cat "$c/status" 2>/dev/null)" = connected ] || continue
+        # NOT `[ -s ]`: sysfs reports every attribute as 0 bytes, so that test
+        # skipped a perfectly good 256-byte EDID on .43 and left the adapter
+        # at f.f.f.f with no error anywhere. Read the header instead, which
+        # also refuses a file that is not an EDID at all.
+        [ "$(head -c 8 "$c/edid" 2>/dev/null | od -An -tx1 | tr -d ' \n')" \
+            = "00ffffffffffff00" ] || continue
+        cec-ctl -d "$d" --phys-addr-from-edid "$c/edid" >/dev/null 2>&1 \
+            && { echo "phys_from=$(basename "$c")"; return 0; }
+    done
+    return 0
+}
+
+case "${1:-detect}" in
+detect)
+    if ! have_tool; then echo "tool=missing"; echo "adapters=0"; exit 0; fi
+    echo "tool=ok"
+    attach_pulse8
+    # Say so when a Pulse-Eight is plugged in, attached or not, so a count of
+    # zero next to a physically present adapter is a diagnosis, not a mystery.
+    for tty in $(pulse8_ports); do
+        if systemctl is-active --quiet "kiosk-cec-pulse8-$tty"; then
+            echo "pulse8=$tty status=attached"
+        else
+            echo "pulse8=$tty status=not-attached"
+        fi
+    done
+    n=0
+    first=""
+    for d in $DEVDIR/cec*; do
+        [ -e "$d" ] || continue
+        n=$((n + 1))
+        [ -n "$first" ] || first="$d"
+        # cec-ctl prints "Driver Name" and "Adapter Name". This matched
+        # "Driver" and "Adapter" alone, so every adapter read "unknown" -- not
+        # noticed until the first adapter ever attached, on .43, 2026-09-11.
+        name=$(cec-ctl -d "$d" 2>/dev/null | sed -n 's/^\s*Driver Name *: *//p' | head -1)
+        adap=$(cec-ctl -d "$d" 2>/dev/null | sed -n 's/^\s*Adapter Name *: *//p' | head -1)
+        set_phys "$d"
+        echo "adapter=$d driver=${name:-unknown} name=${adap:-unknown} phys=$(phys_of "$d")"
+    done
+    echo "adapters=$n"
+    # Asked of the adapter the Wake and Standby buttons use: the first one.
+    if [ -n "$first" ]; then
+        tv_check "$first"
+    fi
+    # Whether an HDMI display is actually attached. The CEC device node comes
+    # from the driver, not from a handshake with a TV -- but on i915 the
+    # adapter is registered per connector, so a machine with nothing plugged
+    # into HDMI is an inconclusive test, not a proven "no CEC".
+    for c in $SYS/class/drm/card*-HDMI*; do
+        [ -e "$c/status" ] || continue
+        echo "hdmi=$(basename "$c") status=$(cat "$c/status")"
+    done
+    ;;
+on)
+    d=$(find_dev) || { echo "no CEC adapter" >&2; exit 1; }
+    cec-ctl -d "$d" --playback >/dev/null 2>&1 || true
+    cec-ctl -d "$d" --to 0 --image-view-on >/dev/null 2>&1
+    cec-ctl -d "$d" --active-source phys-addr="$(cec-ctl -d "$d" 2>/dev/null \
+        | sed -n 's/.*Physical Address *: *//p' | head -1)" >/dev/null 2>&1 || true
+    echo "display woken via $d"
+    ;;
+off)
+    d=$(find_dev) || { echo "no CEC adapter" >&2; exit 1; }
+    cec-ctl -d "$d" --playback >/dev/null 2>&1 || true
+    cec-ctl -d "$d" --to 0 --standby >/dev/null 2>&1
+    echo "display put into standby via $d"
+    ;;
+scan)
+    d=$(find_dev) || { echo "no CEC adapter" >&2; exit 1; }
+    cec-ctl -d "$d" --playback >/dev/null 2>&1 || true
+    cec-ctl -d "$d" -S 2>/dev/null | head -40
+    ;;
+*)
+    echo "usage: kiosk-cec {detect|on|off|scan}" >&2; exit 1 ;;
+esac

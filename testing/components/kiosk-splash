@@ -1,0 +1,110 @@
+#!/bin/bash
+# Boot splash control for the display client. Called by the admin page through sudo.
+#
+#   kiosk-splash status
+#   kiosk-splash enable | disable
+#   kiosk-splash set-image /path/to/file.png
+#   kiosk-splash clear-image
+#
+# The splash is a plymouth "script" theme: a centred image plus a plain
+# progress bar. The image lives in the theme directory because plymouth's
+# hook copies the theme into the initramfs -- which is also why changing it
+# costs an initramfs rebuild, and why this can take a minute on eMMC.
+set -euo pipefail
+
+THEME_DIR=/usr/share/plymouth/themes/kiosk
+IMAGE="$THEME_DIR/splash.png"
+GRUB_DEFAULT=/etc/default/grub
+LOCK=/run/kiosk-splash.lock
+
+[ "$(id -u)" = 0 ] || { echo "must run as root" >&2; exit 1; }
+
+have_plymouth() { command -v plymouth-set-default-theme >/dev/null; }
+
+splash_enabled() {
+    grep -qE '^GRUB_CMDLINE_LINUX_DEFAULT=.*\bsplash\b' "$GRUB_DEFAULT" 2>/dev/null
+}
+
+rebuild() {
+    # Serialise: two concurrent update-initramfs runs corrupt each other.
+    exec 9>"$LOCK"
+    flock -w 300 9 || { echo "another splash update is running" >&2; exit 1; }
+    update-initramfs -u >/dev/null 2>&1 || {
+        echo "update-initramfs failed" >&2; exit 1; }
+    update-grub >/dev/null 2>&1 || true
+}
+
+case "${1:-status}" in
+
+status)
+    echo "enabled=$(splash_enabled && echo yes || echo no)"
+    echo "image=$([ -s "$IMAGE" ] && echo yes || echo no)"
+    echo "plymouth=$(have_plymouth && echo yes || echo no)"
+    echo "theme=$(plymouth-set-default-theme 2>/dev/null || echo none)"
+    [ -e "$LOCK" ] && command -v fuser >/dev/null && \
+        fuser "$LOCK" >/dev/null 2>&1 && echo "busy=yes" || echo "busy=no"
+    ;;
+
+enable)
+    have_plymouth || { echo "plymouth is not installed" >&2; exit 1; }
+    plymouth-set-default-theme kiosk >/dev/null 2>&1 || {
+        echo "could not select the kiosk theme" >&2; exit 1; }
+    if ! splash_enabled; then
+        if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_DEFAULT"; then
+            sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 splash"/' \
+                "$GRUB_DEFAULT"
+        else
+            echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"' >> "$GRUB_DEFAULT"
+        fi
+    fi
+    rebuild
+    echo "boot splash enabled"
+    ;;
+
+disable)
+    # Leave the theme in place; just stop asking for it on the command line.
+    sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT=".*\)[[:space:]]\+splash\(.*\)"/\1\2"/' \
+        "$GRUB_DEFAULT"
+    sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT="\)splash[[:space:]]\+/\1/' \
+        "$GRUB_DEFAULT"
+    sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT="\)splash"/\1"/' "$GRUB_DEFAULT"
+    update-grub >/dev/null 2>&1 || true
+    echo "boot splash disabled"
+    ;;
+
+set-image)
+    src="${2:-}"
+    [ -f "$src" ] || { echo "no such file: $src" >&2; exit 1; }
+    have_plymouth || { echo "plymouth is not installed" >&2; exit 1; }
+    mkdir -p "$THEME_DIR"
+    install -m 0644 "$src" "$IMAGE"
+    # Only rebuild the initramfs when the splash is actually in use.
+    if splash_enabled; then
+        rebuild
+        echo "splash image updated"
+    else
+        echo "splash image stored (enable the splash to use it)"
+    fi
+    ;;
+
+clear-image)
+    # Back to a plain background: the theme still draws its dark backdrop and
+    # the progress bar, there is simply no image on top.
+    if [ -e "$IMAGE" ]; then
+        rm -f "$IMAGE"
+        if splash_enabled; then
+            rebuild
+            echo "splash image removed"
+        else
+            echo "splash image removed (splash is disabled anyway)"
+        fi
+    else
+        echo "no splash image was set"
+    fi
+    ;;
+
+*)
+    echo "usage: kiosk-splash {status|enable|disable|set-image FILE|clear-image}" >&2
+    exit 1
+    ;;
+esac

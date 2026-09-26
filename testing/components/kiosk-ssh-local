@@ -1,0 +1,35 @@
+#!/bin/sh
+# Turn the display's own SSH server on or off. Called by the admin page through
+# sudo (see /etc/sudoers.d/kiosk). The web layer restricts /api/ssh/local to
+# scope `full` (staff), so a customer-scope remote session can never reach it.
+#
+# The image runs SSH as ssh.service (build-rootfs enables ssh, i.e. the
+# service). This keeps that mode on both paths, and it deliberately does NOT
+# prefer ssh.socket just because the socket UNIT FILE exists -- openssh-server
+# ships ssh.socket on every install, enabled or not, and an earlier version of
+# this turned SSH "on" by enabling the socket, which left the service inactive.
+# The admin card reads is-active ssh.service, so SSH would come up socket-
+# activated and yet read "inactive" the instant you turned it on -- a control
+# that looks like it failed. Measured on .63, 2026-09-15.
+#
+# So: ON enables and starts ssh.service and disables the socket (so a socket
+# listener cannot bind the port instead); OFF disables and stops both, because
+# a socket left enabled would re-spawn the service on the next connection.
+set -e
+
+case "$1" in
+  on)
+    systemctl disable --now ssh.socket 2>/dev/null || true
+    systemctl enable --now ssh.service
+    echo "ssh: on"
+    ;;
+  off)
+    systemctl disable --now ssh.socket 2>/dev/null || true
+    systemctl disable --now ssh.service 2>/dev/null || true
+    echo "ssh: off"
+    ;;
+  *)
+    echo "usage: kiosk-ssh-local on|off" >&2
+    exit 1
+    ;;
+esac
