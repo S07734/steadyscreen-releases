@@ -1,0 +1,105 @@
+#!/bin/bash
+# Boot splash for the display: turned on at install, and nothing else.
+#
+#   kiosk-splash status
+#   kiosk-splash enable        (kiosk-install, as root, in the target chroot)
+#
+# The splash is fixed SteadyScreen branding. Owner, 2026-09-26: "I've decided
+# not to allow the bootsplash to be changed. that is a branding item that will
+# stay." So there is no disable, set-image or clear-image any more, and the
+# client has no sudo grant for this. The image changes only when
+# kiosk/plymouth/splash.png changes in the repo and ships in an OS release.
+#
+# The splash is a plymouth "script" theme: a centred image plus a plain
+# progress bar. The image lives in the theme directory because plymouth's
+# hook copies the theme into the initramfs -- which is also why changing it
+# costs an initramfs rebuild, and why this can take a minute on eMMC.
+set -euo pipefail
+
+THEME_DIR=/usr/share/plymouth/themes/kiosk
+# Overridable only so tests/test-splash-install.sh can point initramfs_current
+# at a fake tree; sudo resets the environment, so a real run cannot.
+BOOT="${KIOSK_SPLASH_BOOT:-/boot}"
+IMAGE="$THEME_DIR/splash.png"
+GRUB_DEFAULT=/etc/default/grub
+LOCK=/run/kiosk-splash.lock
+
+[ "$(id -u)" = 0 ] || { echo "must run as root" >&2; exit 1; }
+
+have_plymouth() { command -v plymouth-set-default-theme >/dev/null; }
+
+splash_enabled() {
+    grep -qE '^GRUB_CMDLINE_LINUX_DEFAULT=.*\bsplash\b' "$GRUB_DEFAULT" 2>/dev/null
+}
+
+# Whether every initramfs already carries the current theme. The image builds
+# its initramfs AFTER selecting the theme, so on a fresh install this is true
+# and there is nothing to rebuild -- but `enable` rebuilt it anyway, which is
+# the long "Boot splash" step at the end of every install: 49 s on .63's eMMC
+# (measured 2026-09-26) to produce an initramfs identical in effect to the one
+# already there. "Current" means newer than every file in the theme, so a
+# splash image changed since the last build still triggers a rebuild. No
+# initramfs at all counts as not current: when in doubt, rebuild.
+initramfs_current() {
+    local i found=0
+    for i in "$BOOT"/initrd.img-*; do
+        [ -e "$i" ] || continue
+        found=1
+        lsinitramfs "$i" 2>/dev/null | grep -q "plymouth/themes/kiosk/kiosk.plymouth" || return 1
+        [ -z "$(find "$THEME_DIR" -type f -newer "$i" -print -quit 2>/dev/null)" ] || return 1
+    done
+    [ "$found" = 1 ]
+}
+
+rebuild() {
+    # Serialise: two concurrent update-initramfs runs corrupt each other.
+    exec 9>"$LOCK"
+    flock -w 300 9 || { echo "another splash update is running" >&2; exit 1; }
+    update-initramfs -u >/dev/null 2>&1 || {
+        echo "update-initramfs failed" >&2; exit 1; }
+    update-grub >/dev/null 2>&1 || true
+}
+
+case "${1:-status}" in
+
+status)
+    echo "enabled=$(splash_enabled && echo yes || echo no)"
+    echo "image=$([ -s "$IMAGE" ] && echo yes || echo no)"
+    echo "plymouth=$(have_plymouth && echo yes || echo no)"
+    echo "theme=$(plymouth-set-default-theme 2>/dev/null || echo none)"
+    [ -e "$LOCK" ] && command -v fuser >/dev/null && \
+        fuser "$LOCK" >/dev/null 2>&1 && echo "busy=yes" || echo "busy=no"
+    ;;
+
+enable)
+    have_plymouth || { echo "plymouth is not installed" >&2; exit 1; }
+    before=$(plymouth-set-default-theme 2>/dev/null || true)
+    plymouth-set-default-theme kiosk >/dev/null 2>&1 || {
+        echo "could not select the kiosk theme" >&2; exit 1; }
+    flag_added=no
+    if ! splash_enabled; then
+        if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_DEFAULT" 2>/dev/null; then
+            sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 splash"/' \
+                "$GRUB_DEFAULT"
+        else
+            echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"' >> "$GRUB_DEFAULT"
+        fi
+        flag_added=yes
+    fi
+    # Only the work that something actually needs. The boot command line on
+    # an ESP-arbiter display comes from grub-ab.cfg, which always says splash;
+    # /etc/default/grub is for the few displays not migrated to it, so it gets
+    # update-grub only when its flag really changed.
+    if [ "$before" != kiosk ] || ! initramfs_current; then
+        rebuild
+    elif [ "$flag_added" = yes ]; then
+        update-grub >/dev/null 2>&1 || true
+    fi
+    echo "boot splash enabled"
+    ;;
+
+*)
+    echo "usage: kiosk-splash {status|enable}  (the splash itself cannot be changed)" >&2
+    exit 1
+    ;;
+esac
