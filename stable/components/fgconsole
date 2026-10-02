@@ -1,0 +1,28 @@
+#!/bin/sh
+# fgconsole: print the number of the active virtual console, as kbd's does.
+#
+# It exists for the ScreenConnect agent, not for us. The image has no kbd
+# package, so there was no fgconsole, and the agent's Linux client decides
+# which screen to show by running exactly this: `fgconsole`, then
+# `ps -t tty<N>` to find the X server on that console. With the command
+# missing it has no active console, falls back to the first entry of an
+# unordered hash set of {X display :0, /dev/fb0}, and marks THAT as the
+# session to show. The hash is of an ID that embeds the screen's dimensions,
+# so which one won depended on the resolution: FF12 Cypress and FF07
+# Arlington (1080x1920, "285x506 millimeters") got /dev/fb0 -- a black
+# landscape console framebuffer, no thumbnail, and a black screen on join --
+# while FF11 Plano, rotated the same way at "284x504", got :0. Read out of
+# ScreenConnect.Client.jar (ClientOSToolkit$LinuxClientToolkit,
+# getActiveConsoleNumberAsString / getActiveConsoleDisplayOrFrameBufferFileName),
+# 2026-09-26.
+#
+# The kernel already knows the answer: /sys/class/tty/tty0/active names the
+# foreground console ("tty1"). Nothing else is attempted -- kbd's options are
+# not implemented, and an option makes this fail rather than guess.
+SYS="${KIOSK_FGCONSOLE_SYS:-/sys}"
+[ "$#" -eq 0 ] || { echo "fgconsole: options are not supported here" >&2; exit 1; }
+active=$(cat "$SYS/class/tty/tty0/active" 2>/dev/null) || exit 1
+case "$active" in
+    tty[1-9]|tty[1-9][0-9]) echo "${active#tty}" ;;
+    *) echo "fgconsole: no active console ($active)" >&2; exit 1 ;;
+esac

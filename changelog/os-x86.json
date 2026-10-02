@@ -1,0 +1,149 @@
+{
+ "track": "os-x86",
+ "generated_at": "2026-10-02T04:22:37+00:00",
+ "entries": [
+  {
+   "version": "1.4.10",
+   "notes_md": "- **Installing from Windows also keeps the screen resolution** when Windows was set below the screen's largest, such as a 4K TV run at 1080p.\n- **A newly installed display can read its own update settings**, so its update channel is reported correctly from the start.\n",
+   "date": "2026-09-26",
+   "kernel": "6.12.107",
+   "requires_os": null,
+   "stable_at": null,
+   "channels": [
+    "testing"
+   ]
+  },
+  {
+   "version": "1.4.9",
+   "notes_md": "- **Installing is about a minute quicker**, and the boot-splash step is shown once.\n",
+   "date": "2026-09-26",
+   "kernel": "6.12.107",
+   "requires_os": null,
+   "stable_at": "2026-09-26",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.4.8",
+   "notes_md": "- **Installing from Windows keeps the screen's orientation**, so a portrait screen comes up portrait instead of needing to be rotated by hand.\n- **Remote support shows the real screen on every display**; on some it showed a black screen.\n",
+   "date": "2026-09-26",
+   "kernel": "6.12.107",
+   "requires_os": null,
+   "stable_at": "2026-09-26",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.4.7",
+   "notes_md": "- **The installer asks which updates the display should follow: Stable (recommended) or Testing.** Both the USB installer and the install from Windows ask.\n- **Remote support recovers by itself on a new install**, instead of needing its service restarted by hand.\n",
+   "date": "2026-09-21",
+   "kernel": "6.12.107",
+   "requires_os": null,
+   "stable_at": "2026-09-23",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.4.6",
+   "notes_md": "- **A new display checks for updates before it shows the setup screen**, so it starts on current software.\n- **The remote-support agent is restarted once after the first boot**, so it comes online on its own after an install.\n",
+   "date": "2026-09-21",
+   "kernel": "6.12.107",
+   "requires_os": null,
+   "stable_at": "2026-09-23",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.4.5",
+   "notes_md": "- **A newly installed display enrols for remote support within a minute or two** (it retried every ten minutes).\n",
+   "date": "2026-09-16",
+   "kernel": "6.12.107",
+   "requires_os": null,
+   "stable_at": "2026-09-16",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.4.4",
+   "notes_md": "- **Graphics firmware for AMD processors**, so machines with AMD graphics display correctly.\n- **First-boot services** that check for updates and enrol the display for remote support as soon as it is installed.\n",
+   "date": "2026-09-15",
+   "kernel": "6.12.107",
+   "requires_os": null,
+   "stable_at": "2026-09-16",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.4.3",
+   "notes_md": "- **The display keeps a named “SteadyScreen” entry in the computer's boot menu**, instead of a generic “UEFI OS” entry, so it can be picked out in the firmware menu.\n",
+   "date": "2026-09-02",
+   "kernel": "6.12.107",
+   "requires_os": null,
+   "stable_at": "2026-09-05",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.4.2",
+   "notes_md": "- **The mouse pointer hides after five seconds of not moving.**\n- **Settings chosen during installation are kept**; some were being written where the finished system could not see them.\n",
+   "date": "2026-09-02",
+   "kernel": "6.12.107",
+   "requires_os": null,
+   "stable_at": "2026-09-05",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.4.1",
+   "notes_md": "- **The boot splash no longer resets on every boot.**\n",
+   "date": "2026-08-31",
+   "kernel": "6.12.107",
+   "requires_os": null,
+   "stable_at": "2026-09-05",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.4",
+   "notes_md": "- **Newer Linux kernel (6.12.107).**\n- **The installer applies the latest software staged with it**, so a new display comes up current instead of on the software the image was built with.\n- **The admin page is on the standard web port (80)** on a fresh install; it no longer comes up on 8080.\n",
+   "date": "2026-08-31",
+   "kernel": "6.12.107",
+   "requires_os": null,
+   "stable_at": "2026-09-05",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.3",
+   "notes_md": "- **Network printers found on the local network can be added reliably.** A discovered printer is now attached by its address, because the system could find printers on the network but could not always reach them by name.\n",
+   "date": "2026-08-30",
+   "kernel": "6.12.105",
+   "requires_os": null,
+   "stable_at": "2026-09-05",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  }
+ ]
+}

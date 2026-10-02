@@ -1,0 +1,1008 @@
+{
+ "track": "software",
+ "generated_at": "2026-10-02T04:22:37+00:00",
+ "entries": [
+  {
+   "version": "1.15.34",
+   "notes_md": "- **The screen can now turn off on its own hours.** On the Screensaver card,\n  \"When the screen may turn off\" can follow the screensaver's hours (as\n  before), allow any time, or use its own hours. So the screensaver can run\n  all day while the screen only turns off after hours, and it comes back on\n  when those hours end. Displays keep their current behaviour until this is\n  changed.\n- **Displays are ready to take settings sent from the management console**\n  (the page, permissions, screensaver, keyboard, clock and admin password),\n  so they can be changed on many displays at once. A display checks every\n  value before changing anything, and changes nothing if any value is\n  wrong. Sending settings from the console is not switched on yet.\n",
+   "date": "2026-10-01",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": null,
+   "channels": [
+    "testing"
+   ]
+  },
+  {
+   "version": "1.15.33",
+   "notes_md": "- **Displays can now take actions sent from the management console**, such as\n  a hard reload, restarting the browser or restarting the display, so they\n  can be applied to many displays at once. A display runs only an action that\n  is signed by the management server, meant for that display, recent, and\n  allowed for the person who sent it; it never runs the same action twice,\n  and it reports back whether each one worked. Sending actions from the\n  console is not switched on yet.\n",
+   "date": "2026-10-01",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": null,
+   "channels": [
+    "testing"
+   ]
+  },
+  {
+   "version": "1.15.32",
+   "notes_md": "- **Displays now report whether they can be woken over the network.** Each\n  display tells the management console whether its network card supports\n  wake-on-LAN, whether it is switched on, and the address to send the wake to,\n  so a display that has gone dark can be woken remotely where the hardware\n  allows it.\n- **Less is sent to the management console.** The video check result and the\n  wake-on-LAN details are sent only when they change, plus once a day,\n  instead of with every hourly check-in.\n- **The video check is fairer.** It lets the video settle for a second before\n  measuring and tries both sizes every time, so a display that plays 1080p\n  smoothly is no longer marked down by a slow start. Every display checks once\n  more at its next startup.\n",
+   "date": "2026-09-28",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": null,
+   "channels": [
+    "testing"
+   ]
+  },
+  {
+   "version": "1.15.31",
+   "notes_md": "- **The video check is stricter, and its result now reaches the management\n  console.** A display whose video engine can't count the frames it shows,\n  or whose picture is frozen or black, no longer counts as playing video. The\n  check runs once more at the next startup so every display is measured the\n  same way. The result now reaches the management console with the display's\n  regular check-in, so it can be seen for the whole fleet. It still only\n  measures; nothing about how a page or its videos play has changed.\n",
+   "date": "2026-09-27",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": null,
+   "channels": [
+    "testing"
+   ]
+  },
+  {
+   "version": "1.15.30",
+   "notes_md": "- **Each display now checks how well it can play video, and reports it.** Once\n  at startup, and again after an operating system update or when someone\n  presses **Re-check video** on the Display card, a display plays a short\n  test clip for about 15 seconds before its page appears, and records whether\n  it plays video smoothly at 720p and at 1080p. The Display card shows the\n  result. This only measures: nothing about how a page or its videos play\n  has changed.\n",
+   "date": "2026-09-27",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": null,
+   "channels": [
+    "testing"
+   ]
+  },
+  {
+   "version": "1.15.29",
+   "notes_md": "- **A display only installs an operating system update built for its own\n  hardware.** This gets things ready for SteadyScreen on more kinds of\n  hardware. Every display checks that an OS update matches the machine it is\n  running on, both when it downloads the update and again before it installs\n  it, and refuses one that does not.\n- **An update that states a minimum OS version the display can't read is now\n  refused, instead of being treated as having no minimum.** Nothing published\n  today is affected; this closes a gap before it could matter.\n- **The boot-path migration tool refuses to run on hardware it wasn't made\n  for**, rather than trying and leaving the display unable to start.\n",
+   "date": "2026-09-27",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": null,
+   "channels": [
+    "testing"
+   ]
+  },
+  {
+   "version": "1.15.28",
+   "notes_md": "- **Displays installed since mid-September report their update channel\n  again.** The installer left the display's update settings readable only by\n  the system, so the display couldn't read them itself. Updates kept working,\n  but the display's channel showed blank in the management console and its\n  Updates settings showed defaults. The display now puts that right on its\n  next update check.\n",
+   "date": "2026-09-26",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-26",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.27",
+   "notes_md": "- **Installing is about a minute quicker, and the boot splash step shows\n  once.** Turning on the boot splash at the end of an install rebuilt part of\n  the system that was already ready, which took close to a minute on slower\n  machines. It now skips that when nothing has changed.\n- **The boot splash is fixed SteadyScreen branding.** The hidden settings\n  that could replace or remove it on a display are gone. The SteadyScreen\n  logo on the welcome and admin pages is unchanged.\n",
+   "date": "2026-09-26",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-26",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.26",
+   "notes_md": "- **Installing is about a minute quicker, and the boot splash step shows\n  once.** Turning on the boot splash at the end of an install rebuilt part of\n  the system that the installer already had ready, which took close to a\n  minute on slower machines. It now skips that when nothing has changed.\n",
+   "date": "2026-09-26",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-26",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.25",
+   "notes_md": "- **ScreenConnect now shows the display's real screen on every machine.** On\n  some displays (seen on portrait ones) the ScreenConnect thumbnail was\n  missing and joining showed a black landscape screen, because the agent was\n  picking the console framebuffer instead of the picture on screen. The\n  agent relies on a small system command to find the right screen, and the\n  image didn't have it. The display now supplies it. Proven on a store display\n  that had it: thumbnail and live view back without switching sessions by hand.\n",
+   "date": "2026-09-26",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-26",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.24",
+   "notes_md": "- **The clock screensaver shows the full date with the year**, as\n  \"Thursday September 24, 2026\" (it was \"Thursday 24 September\").\n- **The SSH \"Log in as\" line no longer points at the wrong machine when the\n  admin page is opened through remote admin.** It printed the remote-admin\n  address, which leads to the server rather than the display. It now shows the\n  display's own network address, and says SSH only works from the display's\n  own network.\n",
+   "date": "2026-09-24",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-26",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.23",
+   "notes_md": "- **\"Turn the screen off after\" now puts the TV into standby over HDMI-CEC.**\n  On a display with a CEC adapter, the screen-off timer sends the TV to\n  standby as well as switching the picture off, instead of leaving a lit\n  \"no signal\" screen. Whatever brings the screen back also wakes the TV: a\n  touch, the screensaver hours ending, the setting being switched off, or the\n  display restarting. It only wakes a TV that the display itself put into\n  standby, so a TV the shop turned off with its own remote is left alone.\n  Displays without CEC behave exactly as before. Proven on an office test\n  display with a Pulse-Eight adapter: standby, wake, and wake after a restart.\n",
+   "date": "2026-09-24",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-26",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.22",
+   "notes_md": "- **Pinch-to-zoom is now actually held on a touch panel.** The lock (off by\n  default) stops a customer pinching the page out of shape and leaving it that\n  way. WebKit on a touch panel ignored the page-level block, and a pinch scales\n  the page rather than the browser zoom, so the earlier browser-zoom clamp missed\n  it too. The display now intercepts the two-finger gesture itself, before WebKit\n  can assemble it into a zoom. Proven on a real touch panel: with the lock on a\n  pinch does nothing and a one-finger scroll still works; with the lock off pinch\n  zooms normally.\n",
+   "date": "2026-09-23",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-23",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.21",
+   "notes_md": "- **You can clear a display's page now, and it drops back to the welcome\n  screen.** Leaving the page URL blank in the admin used to be rejected, so once\n  a page was set the only move was to point it somewhere else. Now a blank URL\n  clears it and the display shows its welcome screen again -- and the admin shows\n  a cleared page as an empty box and \"Welcome screen\", not the literal\n  \"about:blank\" or an internal address.\n\n- **Pinch-to-zoom is held at the browser level, not just the page.** The lock\n  (off by default) put a no-zoom viewport on the customer's page, but on a touch\n  panel WebKit ignored it and a customer could still pinch the page out of shape.\n  The display now also snaps the zoom back whenever the lock is on, so a pinch no\n  longer sticks.\n",
+   "date": "2026-09-23",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-23",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.20",
+   "notes_md": "- **The \"checking for updates\" screen no longer has a red border.** That red edge\n  means \"the page is unreachable\"; it belongs on a customer's page, not on one of\n  our own setup screens, which already say in words what the network is doing. It\n  was suppressed on the welcome and startup screens but had been missed on this\n  one.\n\n- **A standalone display no longer shows the \"belongs to an existing account\"\n  notice.** A layout bug left that notice on screen on every display from the\n  moment it loaded -- including displays that are in nobody's account. Now it\n  appears only when a display genuinely was reinstalled while claimed to an\n  account, and then it takes the place of the \"link to an account\" box rather\n  than sitting beside it. The wording is shorter, and it shows the display's\n  device key so you can check it against the one your account shows.\n\n- **The device key and the account pairing code are now clearly different\n  things.** The 12-character value derived from a display's key is called the\n  \"device key\" everywhere -- the setup screen, the admin page (it had been\n  mislabeled \"pairing code\"), and the reinstalled notice -- and the account\n  pairing code stays the account pairing code. One is how you confirm a display's\n  identity; the other is how you link a new display to an account.\n",
+   "date": "2026-09-22",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-23",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.19",
+   "notes_md": "- **A ScreenConnect agent that installs but dies is now brought back\n  automatically.** ConnectWise's own postinstall sometimes leaves the service\n  dead a few seconds after a fresh convert first comes up -- which is why a new\n  display so often had to have \"Restart service\" pressed by hand before it\n  appeared in the console. Every display now checks on each update pass whether\n  its agent is installed-but-stopped and restarts it, retrying until it stays up.\n  Because it rides the ordinary software update, a display already in the field\n  self-heals at its next check -- no reflash -- and it keeps watch afterwards, so\n  an agent that dies later comes back on its own. (Delivered as a component; a\n  display gets it on whichever channel it tracks.)\n\n- **First-boot enrolment retries until the agent is actually running**, instead\n  of trusting a single delayed restart. On a machine installed from a new image,\n  the agent comes up within a minute or two of first boot and is confirmed to\n  stay up before the enrolment step stands down.\n\n- **The installer now asks which updates a display should receive.** Stable\n  (strongly recommended) or Testing (risky). Stable stays the default and is what\n  a store display should be on; Testing is the opt-in for a bench display that\n  needs unreleased software. The from-Windows converter shows the same choice,\n  and a batch file that says nothing still installs Stable exactly as before.\n",
+   "date": "2026-09-22",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-23",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.18",
+   "notes_md": "This release ships with a new OS image (os 1.4.6). The software is delivered as\nnormal signed components; the image is what carries the parts a component cannot\ninstall for itself — the first-boot gate and the ScreenConnect first-boot\nenrolment — so a machine gets the full behaviour only when it is installed from\nthis image.\n\n- **A fresh display checks for updates before it shows the setup screen.** On the\n  very first boot it briefly says \"checking for updates\" and applies anything\n  waiting, so a new install lands current instead of coming up on the image's\n  baked-in software and only catching up hours later at its first update window.\n  It never strands the boot: no network, or nothing to fetch, and it goes\n  straight on to setup.\n\n- **The installer no longer asks for a Display name.** The setup screens now show\n  the machine's own hostname (ds-hwid) instead. A name typed at install time was\n  only ever a second label for the same box; the admin page can still set a\n  friendly name whenever you want one.\n\n- **A reinstalled display that belongs to an account waits for the owner to\n  approve it.** Reinstalling or resetting a claimed display mints a new device\n  key; rather than trusting whoever reflashed it, the server holds the new key\n  pending and the account owner approves the change from their own portal — no\n  call to us. A standalone display (in nobody's account) still just pairs, so a\n  forgotten admin password is always recoverable by reinstalling.\n\n- **Wake-on-LAN is enabled on supported wired machines (x86).** A display on\n  hardware we control can be woken from the LAN after it is powered off. It\n  detects and reports whether the machine is even a candidate — firmware still\n  has to keep the NIC powered in S5 — so you can tell which displays WoL can\n  actually reach rather than finding out a BIOS setting did nothing.\n\n- **Restarting the browser now waits until the page is back before it reports\n  done**, the same way reboot and update already do, instead of returning while\n  the screen is still black.\n\n- **A freshly enrolled display restarts its ScreenConnect agent once, by\n  itself.** ConnectWise's installer can leave the service dead a few seconds\n  after first boot, which is why a new convert so often needed the admin page's\n  \"Restart service\" pressed by hand before it appeared in the console. The\n  display now does that press automatically, once, after the agent has settled.\n",
+   "date": "2026-09-21",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-23",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.17",
+   "notes_md": "- **The page-reload settings moved to the Page tab and got clearer.** Two\n  separate things now, instead of one vague \"auto-reload\":\n  - **Idle reset** returns the display to its page after it has been idle for a\n    while -- a kiosk going back to its login screen. A normal reload.\n  - **Auto-reload** does a hard refresh to pick up a new version of the web app,\n    on whichever trigger you choose: after the display has been idle, or at a set\n    time of day. By default it only reloads while the page is reachable, so it\n    never refreshes onto a blank screen.\n\n- **Pinch-to-zoom can be turned off, and is off by default.** Under Permissions:\n  a customer at a touch display can no longer pinch the page out of shape and\n  leave it that way for the next person. Turn it back on for a display where\n  pinching is wanted.\n",
+   "date": "2026-09-21",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-23",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.16",
+   "notes_md": "- **Screen rotation now holds across a reboot, and Portrait means Portrait.**\n  Two fixes for the rotation setting, both found on a converted display:\n  - **It sticks now, even without a touchscreen.** On a marketing or menu board\n    (no touchscreen at all), setting a rotation turned the screen but did not\n    survive the next reboot -- it came back Landscape -- because a \"no\n    touchscreen\" result was mistaken for a failure and the setting was never\n    saved. Whether the screen actually turned is now what counts, so the\n    rotation is written down and re-applied on every boot.\n  - **Portrait and Portrait (flipped) were the wrong way round.** A panel that\n    Windows called \"Portrait\" only came up right-side-up if you chose \"Portrait\n    (flipped)\". They are corrected, so the label matches the physical result --\n    choose Portrait for a Windows-Portrait panel.\n",
+   "date": "2026-09-20",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-23",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.15",
+   "notes_md": "- The **Screen rotation** setting now uses the same words as Windows --\n  **Landscape**, **Portrait**, **Landscape (flipped)**, **Portrait (flipped)**\n  -- instead of \"90 left / 90 right\". It matches what the same panel was set to\n  under Windows, so there is nothing to translate. Nothing about how a display\n  rotates changed; only the labels.\n\n- **Machines converted from Windows now come up on whatever Wi-Fi they were on,\n  open networks included.** The installer keeps the exact connection it used to\n  reach the network rather than assuming a WPA2 password -- so an open network,\n  or a WPA3 one, is no longer left unable to rejoin the network it was installed\n  over. (This is in the installer, so it applies to new conversions, not to a\n  display that is already running.)\n",
+   "date": "2026-09-17",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-23",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.14",
+   "notes_md": "- The **Rollback snapshots** card lists the saved snapshots again. A display\n  that had taken three or more of them -- by now, every display -- showed\n  \"None yet\" even though the snapshots were there and an undo would have\n  worked: the page was cutting the list off before it could be read. The\n  snapshots themselves were never touched, and a rollback still worked from\n  the command line the whole time; this only restores the page's view of them.\n",
+   "date": "2026-09-16",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-23",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.13",
+   "notes_md": "- The Remote support card now has two buttons to recover the ScreenConnect\n  agent without a reboot: **Restart service** and **Reinstall agent**. On a\n  fresh install the agent can install but not come up (ConnectWise's service\n  does not retry itself), and until now the only fix was a reboot -- which the\n  displays this ships to have nobody to do. Now it is a button on the admin\n  page, the one channel that stays reachable when ScreenConnect does not. The\n  buttons appear once an agent is installed.\n",
+   "date": "2026-09-16",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-16",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.12",
+   "notes_md": "- A newly set-up display now checks for the latest software as soon as it comes\n  online and updates itself right away, instead of waiting for its next hourly\n  check.\n- A newly set-up display now sends its first heartbeat the moment it comes\n  online, instead of waiting up to five minutes, so it appears in your fleet\n  right away.\n- The ScreenConnect agent a new display installs is now reliably started, is\n  retried every minute until it enrols (so the tile appears in a minute or two,\n  not ten), and can now show the display's screen in your console instead of a\n  black frame.\n",
+   "date": "2026-09-16",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-16",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.11",
+   "notes_md": "- A newly set-up display now checks for the latest software as soon as it comes\n  online and updates itself right away, instead of waiting for its next hourly\n  check.\n- The ScreenConnect agent a new display installs is now reliably started and can\n  show the display's screen in your console.\n",
+   "date": "2026-09-16",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-15",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.10",
+   "notes_md": "- Turning the SSH server on from the Remote access card now shows correctly as\n  running. On the previous version it could briefly read \"inactive\" just after\n  you turned it on, though SSH was in fact up.\n",
+   "date": "2026-09-16",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-15",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.9",
+   "notes_md": "- The SSH server on/off switch in the Remote access card now works on displays\n  that were updated in place, not only freshly imaged ones. Where it cannot act,\n  it greys out and says why instead of looking like it works.\n",
+   "date": "2026-09-16",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-15",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.8",
+   "notes_md": "- A newly set-up or converted display now connects to your ScreenConnect\n  console by itself on first boot, so you have a way to reach it even before it\n  has checked in — and a display converted from Windows comes back as the same\n  console entry it was, not a new one. (Turned on per install by your own\n  setup; a plain display with no console configured does nothing here.)\n- Displays on AMD graphics hardware now load the proper graphics driver.\n  Nothing on screen changes on the machines that already worked; this prevents\n  a blank screen on some AMD models.\n- Staff can turn the display's own SSH server on or off from the Remote access\n  card. The admin page and ScreenConnect keep working either way.\n- A test print to a printer that is not ready now reports \"not ready\" plainly\n  instead of looking like a server error.\n- After an update, a display reports its new version to your management account\n  straight away, instead of up to five minutes later.\n",
+   "date": "2026-09-15",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-15",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.7",
+   "notes_md": "- The Account pairing card is tidied: the staff device-key and remote-session\n  details are removed from it, and the \"linked to your account\" line now shows\n  \"Checking account link…\" until your management server reports the link, so a\n  linked display never briefly reads \"Not linked\" by mistake.\n",
+   "date": "2026-09-15",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-15",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.6",
+   "notes_md": "- The System tab now opens on the Status card, and the old \"Remote admin\"\n  section is folded into \"Account pairing\" — which now shows which SteadyScreen\n  account and location this display is linked to, once it is linked.\n- Any change made on the display now updates your management account straight\n  away, instead of waiting for its next hourly check-in. Nothing on the display's\n  own screen changes.\n",
+   "date": "2026-09-15",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-15",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.5",
+   "notes_md": "- Your team can now open a display's admin page from your SteadyScreen account,\n  and what each person can change depends on their role. Owners and operators\n  get everything except the SSH settings; a user can see the page and its\n  status and run printer test prints, and can change the displayed page only if\n  you give them that permission. Nothing on the display's own screen changes.\n",
+   "date": "2026-09-15",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-15",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.4",
+   "notes_md": "- A display with no page set now shows a pairing code on its own screen. Enter\n  that code at ssm.steadyscreen.com/activate to link the display to your\n  SteadyScreen account.\n- The admin page has a new \"Account pairing\" card with a \"Show pairing code\"\n  button, to link a display that already has a page — and to move a display\n  that is linked to another account, by asking that owner to release it.\n",
+   "date": "2026-09-14",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-15",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.3",
+   "notes_md": "- When you change something on a display — its page, or any setting — it now\n  tells your management account straight away, instead of at its next hourly\n  check-in. Nothing on the screen changes.\n",
+   "date": "2026-09-14",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-15",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.2",
+   "notes_md": "- The display now tells your management account which page it is set to show,\n  so that address appears on the display's card in your account. Nothing on\n  the screen changes, and a display that has no page set yet reports nothing.\n",
+   "date": "2026-09-14",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-15",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.1",
+   "notes_md": "- Remote admin: after the owner approves a display on the fleet page, the\n  display now notices within a few minutes instead of up to an hour. It\n  checks in more often only while it is waiting to be approved, and only for\n  its first day up. Nothing else changes.\n",
+   "date": "2026-09-13",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-15",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.15.0",
+   "notes_md": "- 1.15.0 is the first release in which displays genuinely work with the\n  management server, gathered under one milestone version. It carries the\n  remote-admin work that was on testing as 1.14.137-1.14.144: each display's\n  own device key (approved once from the fleet page by a 12-character pairing\n  code), the doorbell, the relay client that shows the display's real admin\n  page through the server, and the touch-calibration safeguards. The code is\n  byte-for-byte what ran on testing as 1.14.144; only the version changes.\n  Nothing appears on a display's own screen, and nothing opens until the\n  display is approved.\n",
+   "date": "2026-09-13",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-13",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.144",
+   "notes_md": "- Remote admin: the touch-screen calibration button is now hidden when the\n  admin page is viewed remotely, since calibration must be measured at the\n  display. It was already refused server-side; now it is not offered either.\n  Nothing else changes.\n",
+   "date": "2026-09-13",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-13",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.143",
+   "notes_md": "- Remote admin safety: the touch-screen calibration tool can no longer be\n  used through a remote admin session. A calibration has to be measured by\n  touching the display itself; one measured in a remote browser would leave\n  the store's screen mis-aligned. Nothing else changes.\n",
+   "date": "2026-09-13",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-13",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.142",
+   "notes_md": "- Remote admin: the display now reads the server's \"you may connect\" message\n  correctly (its expiry is a date, which an earlier build misread), and it\n  refuses one whose expiry is implausibly far ahead, so a stray or replayed\n  message can never open a display. Nothing appears on the display's screen.\n",
+   "date": "2026-09-13",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-13",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.141",
+   "notes_md": "- Remote admin, step 3: an approved display can now, when the owner opens it\n  from the fleet page, connect out to the management server and show its real\n  admin page there. It replays each request inside its own process, with no\n  network port opened on the display. Nothing appears on the display's own\n  screen. It does nothing until a session is opened, and only for an approved\n  display with remote admin left on.\n",
+   "date": "2026-09-13",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-13",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.140",
+   "notes_md": "- Remote admin: when the management server restarts, an approved display\n  now reconnects within seconds instead of waiting five minutes.\n- The admin page, when shown remotely through the management server, no\n  longer tries to jump to another port after an update.\n",
+   "date": "2026-09-13",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-13",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.139",
+   "notes_md": "- Each display now shows a 12-character pairing code, for approving it once\n  on the fleet page: large at the top of the admin page's System tab, and on\n  the setup screens. The fleet page shows the same code, so approving is a\n  matter of checking the two match.\n- A display that has been approved now remembers it across a restart,\n  instead of waiting up to an hour to hear it again from the server.\n",
+   "date": "2026-09-13",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-13",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.138",
+   "notes_md": "- Remote admin, step 2. Once the owner has approved a display on the fleet\n  page, the display keeps one quiet request open to the management server,\n  so the server can reach it within seconds when remote admin is used.\n  Nothing appears on screen. It does nothing until the display is approved,\n  and nothing more until remote admin itself, the next step, is released.\n",
+   "date": "2026-09-13",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-13",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.137",
+   "notes_md": "- Each display now makes its own device key the first time it starts on\n  this version, and shows its fingerprint on the admin page (System tab,\n  Remote admin). The public half goes with the heartbeat, so the owner can\n  approve each display once on the fleet page. The private key never leaves\n  the display. Remote admin itself is not here yet.\n",
+   "date": "2026-09-12",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-13",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.136",
+   "notes_md": "- The display's heartbeat to the management server now also carries the\n  display's address on its own local network (for example 192.0.2.50),\n  so the fleet page can link to its admin page. Only a private local\n  address is ever sent -- never a public internet address. Nothing else is\n  added.\n",
+   "date": "2026-09-12",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-12",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.135",
+   "notes_md": "- The display's heartbeat to the management server now also carries the\n  display's own name (the ds- name it shows on screen) and whether it takes stable or\n  testing updates. Nothing else is added. Either is left out when the\n  display cannot read it truthfully.\n",
+   "date": "2026-09-12",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-12",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.134",
+   "notes_md": "- The display's heartbeat to the management server now also carries the\n  date the display was installed and how long it has been running since it\n  last started. Nothing else is added. Either is left out when the display\n  cannot read it truthfully.\n",
+   "date": "2026-09-12",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-12",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.133",
+   "notes_md": "- The display's status API no longer reports its heartbeat to the management\n  server: not the message it last sent, not when, and not the result. The\n  heartbeat itself is unchanged and still sends only the display's id, its\n  software version and its OS version.\n",
+   "date": "2026-09-12",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-12",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.132",
+   "notes_md": "- Displays can now receive and keep a signed activation date from the\n  SteadyScreen management server, and let other displays on the same network\n  read it. It is the groundwork for the free-display limit per location.\n  Nothing on the screen changes, and no display limits itself in this release.\n",
+   "date": "2026-09-12",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-12",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.131",
+   "notes_md": "- The Management server card is gone from the System tab. On the testing\n  channel every display reports to the SteadyScreen management server, as the\n  owner decided, and there is no switch to turn it off. What it sends is still\n  only the display's id, its software version and its OS version.\n",
+   "date": "2026-09-12",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-12",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.130",
+   "notes_md": "- Displays now report to the SteadyScreen management server at\n  ssm.steadyscreen.com by default: once a day, just the display's id, its\n  software version and its OS version. The Management server card on the\n  System tab shows exactly what was sent. Clearing the address, or switching\n  the heartbeat off, stops it.\n",
+   "date": "2026-09-12",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-12",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.129",
+   "notes_md": "- The display can now tell a SteadyScreen management server that it exists.\n  Once a day it sends its id, its software version and its OS version —\n  nothing else — and the System tab has a new **Management server** card that\n  shows exactly what was sent and when, with a switch to turn it off.\n- Nothing is sent until a server address is set, and none is set by default.\n  Whatever the server does, the display's own page is never affected.\n",
+   "date": "2026-09-12",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-12",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.128",
+   "notes_md": "- Text on the admin page no longer breaks in the middle of words. Longer\n  messages, such as the Display tab's note about the TV's HDMI-CEC setting,\n  now wrap between words like normal text. Long addresses and keys still wrap\n  so they fit on a phone.\n",
+   "date": "2026-09-12",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-12",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.127",
+   "notes_md": "- A Pulse-Eight USB HDMI-CEC adapter now works. Plug it in between the display\n  and the TV and the display finds it and sets it up by itself, so the Wake and\n  Standby buttons on the Display tab turn the TV on and off.\n- The Display tab now tells you whether the TV itself is listening. If the\n  TV's own HDMI-CEC setting is switched off, it says so and names the setting\n  to turn on — SIMPLINK on LG, Anynet+ on Samsung, BRAVIA Sync on Sony —\n  instead of the buttons silently doing nothing.\n",
+   "date": "2026-09-11",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-12",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.126",
+   "notes_md": "- Holding a finger on the saved page to reach the setup screen no longer keeps\n  it there. The display waits another minute and, if the site still cannot be\n  reached, goes back to showing the menu. A customer who holds the glass on an\n  offline kiosk can no longer leave a display stuck on a diagnostics screen.\n- Anyone actually working on the machine is not interrupted: every touch puts\n  the minute back to the start. To stop it altogether, press **Scan for\n  networks** and then **Stay on this screen**.\n- That stop now lasts for the outage rather than until the display is\n  restarted. As soon as the site can be reached again, everything holding the\n  saved page back is released.\n",
+   "date": "2026-09-11",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-12",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.125",
+   "notes_md": "- The saved page now comes up when a display loses its site **while it is\n  running**, not only when it reboots with the network already down. A menu\n  board that has been up for a week and loses its connection waits a minute\n  and then shows the last picture of the menu, framed in red, instead of\n  sitting on the network diagnostic screen.\n- The minute is counted from when the diagnostic screen appeared, so a brief\n  connection hiccup cannot put a photograph up in place of a live page, and\n  touching the screen still starts the minute again.\n",
+   "date": "2026-09-11",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-12",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.124",
+   "notes_md": "- The on-screen keyboard now puts itself away after 30 seconds with nothing\n  typed, so it stops covering half the page when nobody is using it. Typing,\n  or touching the screen, keeps it up.\n- If somebody types on a real keyboard plugged into the display, the\n  on-screen keyboard gets out of the way. Touching the screen brings it back,\n  so a barcode scanner cannot leave a customer without a keyboard.\n",
+   "date": "2026-09-10",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-10",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.123",
+   "notes_md": "- The display now answers the usual refresh keys, so a page that has gone\n  stale can be reloaded from the display itself without a mouse or a menu.\n  F5 or Ctrl+R reloads the page. Ctrl+F5, Shift+F5 or Ctrl+Shift+R reloads it\n  ignoring anything saved from last time.\n- If the display is showing \"cannot reach the site\", pressing F5 tries the\n  site again rather than reloading that message.\n",
+   "date": "2026-09-10",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-10",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.122",
+   "notes_md": "- Fixes the remote-support pop-up that could sit on top of the customer page\n  until somebody restarted the display. The display already closes those\n  pop-ups by itself; it was closing the first one and then stopping, so every\n  one after that stayed on screen.\n- After an update, the display now checks that the pop-up closer is actually\n  running instead of reporting that it started it. It said it had started on a\n  display where it had already stopped.\n- Setting up remote support on a display now checks the pop-up closer is\n  installed, and says what to run if it is not. Remote support is what causes\n  the pop-ups, so it is where the check belongs.\n",
+   "date": "2026-09-09",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-10",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.121",
+   "notes_md": "- Fixes updates never installing on a display that has an admin password set.\n  The display installed the update, decided the client had not come back —\n  because it asked without signing in and was told 401 — and rolled it back.\n  Every night, silently, with nothing to show for it but the old version.\n- Two displays were stuck this way. They pick this up on their own at the next\n  window and are then able to update normally again.\n",
+   "date": "2026-09-08",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-08",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.120",
+   "notes_md": "- Fixes the boot splash being changeable by anything that can reach the\n  display. Branding is meant to be managed centrally, and reading it was\n  refused — but replacing or deleting it was not. Anything on the same network\n  could have cleared a shop's splash.\n- Fixes \"Wake the display\" waking the screen for a second and then letting the\n  screensaver straight back. It now stays awake for the same idle time a touch\n  on the display would give it. The same fault meant a receipt printing\n  brought the page back for only a few seconds.\n- The screenshot checkbox is labelled \"auto refresh\" rather than \"live\".\n",
+   "date": "2026-09-07",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-07",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.119",
+   "notes_md": "- Fixes the boot splash being changeable by anything on the network. Branding\n  is meant to be managed centrally, and reading it was refused — but changing\n  or removing it was not. Anything that could reach the display could clear a\n  shop's splash.\n- Adds a screensaver that shows your own picture. It is part of a licensed\n  display: on a display without that licence the option is not offered and the\n  upload is refused.\n",
+   "date": "2026-09-07",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-07",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.118",
+   "notes_md": "- Fixes \"Wake the display\" waking the screen for a second and then letting the\n  screensaver straight back. It now stays awake for the same idle time as a\n  touch on the display would give it.\n- The same fault meant a receipt printing brought the page back for only a few\n  seconds. It now stays up.\n- The screenshot checkbox is labelled \"auto refresh\" rather than \"live\".\n",
+   "date": "2026-09-07",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-07",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.117",
+   "notes_md": "- Fixes the on-screen keyboard being too wide on the admin page, where on a\n  1280-wide screen the right-hand keys ran off the edge. It was picking up the\n  admin page's own button sizing.\n- The keyboard is now sealed off from the page it appears on, so nothing a\n  page does to its own buttons or text can change it. It looked wrong only on\n  the admin page, but any page could have done the same.\n",
+   "date": "2026-09-07",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-07",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.116",
+   "notes_md": "This is everything since the last stable release, 1.14.105. Nothing here\nchanges on its own: the screensaver and the power saving are off until you\nswitch them on.\n\nA screensaver, off unless you turn it on\n\n- There is a Screensaver card on the Display page. Set \"Start after\" and the\n  display shows a screensaver once it has been left alone for that long.\n  Touching the screen brings the page straight back, and that first touch is\n  not passed on to the page — so waking a display cannot press a button on it.\n- Two to choose from: the SteadyScreen mark, and a clock showing the time and\n  the date. Both drift slowly around the screen, which also keeps a still page\n  from marking the panel. The clock follows the display's own time zone, so if\n  it shows the wrong time, check the Clock card.\n- It is deliberately not a blank screen. A dark display looks like a broken\n  one from across a room.\n- You can say when it is allowed to run. Leave it on \"any time of day\", or set\n  hours — a shop that does not want it during trading sets it to run from\n  closing until opening, and a window that crosses midnight is fine. If the\n  hours end while the screensaver is showing, the display comes back on its\n  own rather than waiting for somebody to touch it.\n- It never covers the screens the display uses to tell you something — no\n  network, the saved page, first-time setup — nor the admin page while\n  somebody is on it. If a receipt prints, the screen comes back so you can see\n  which display printed it.\n\nTurning the screen off to save power\n\n- The same card can turn the screen off as well. Set \"Turn the screen off\n  after\" and the display goes dark once it has been left alone that long.\n  Touching it brings it straight back.\n- The two times are independent, both counted from the last touch. Set the\n  screen to turn off sooner than the screensaver and the screensaver never\n  appears; set it later and the screensaver plays until then. Both keep to the\n  hours you set.\n- A television shows \"no signal\" while the screen is off. That is normal, and\n  it comes back the moment somebody touches the display — but try it on one\n  display before setting it everywhere, because how quickly a screen lights up\n  again is down to the screen.\n- If the screen has been turned off, the admin page says so, in the live view\n  and on the Screensaver card. A display saving power cannot be mistaken there\n  for one that has stopped working, because the picture itself cannot show the\n  difference.\n\nInstalling an update shows what it is doing\n\n- The confirmation box now stays open, reports each step as it happens, says\n  when the display is restarting, and reloads the page by itself once the\n  display is back. It used to close as soon as you pressed Install and leave\n  you with one line while the display went away.\n- If the display comes back on the same version it says so, rather than\n  reporting success — the update did not take, or something put it back.\n\nFixes\n\n- Ctrl+Alt+A went to the wrong place when the display was showing one of its\n  own screens. On a display sitting on the network screen because its site is\n  unreachable, the first press went to that unreachable site and only a second\n  press reached the admin page. One press now.\n- The admin page can wake a display. When the screensaver is showing, or the\n  screen is off, a \"Wake the display\" button appears beside the screenshot.\n- Card headings on the admin page sit on a band of their own, so sections are\n  easier to pick out when scrolling.\n",
+   "date": "2026-09-07",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-07",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.115",
+   "notes_md": "- Installing an update now shows what it is doing. The confirmation box stays\n  open, reports each step as it happens, says when the display is restarting,\n  and reloads the page by itself once the display is back.\n- If the display comes back on the same version, it says so rather than\n  reporting success — the update did not take, or something put it back.\n",
+   "date": "2026-09-07",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-07",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.114",
+   "notes_md": "- Installing an update now shows what it is doing. The confirmation box stays\n  open and reports each step through to completion, including while the\n  display restarts, and the page reloads itself once the display is back.\n",
+   "date": "2026-09-07",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-07",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.113",
+   "notes_md": "- Fixes Ctrl+Alt+A going to the wrong place when the display was showing one\n  of its own screens. On a display sitting on the network screen because its\n  site is unreachable, the first press went to that unreachable site and only\n  a second press reached the admin page. One press now.\n- The admin page can wake a display. When the screensaver is showing, or the\n  screen has been turned off to save power, a \"Wake the display\" button\n  appears beside the screenshot.\n- The live view now says when the screen has been turned off to save power.\n  The picture cannot show it — turning the screen off does not change what the\n  display is drawing — so a display saving power used to look completely\n  normal there.\n",
+   "date": "2026-09-07",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-07",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.112",
+   "notes_md": "- Card headings on the admin page now sit on a band of their own, so each\n  section is easier to pick out when scrolling.\n",
+   "date": "2026-09-06",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-07",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.111",
+   "notes_md": "- The SteadyScreen mark is now always the first choice in the Screensaver\n  list, whatever else is added to it.\n",
+   "date": "2026-09-06",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-07",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.110",
+   "notes_md": "- The screensaver no longer drifts along the same diagonal and back. It sets\n  off in a different direction each time, and changes course slightly whenever\n  it reaches an edge, so it wanders the whole screen instead of retracing one\n  line.\n- The clock is a little smaller, which gives it room to move and keeps it\n  clear of the edges.\n- The Screensaver settings are less wordy.\n",
+   "date": "2026-09-06",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-07",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.109",
+   "notes_md": "- A second screensaver: a clock. Pick it under Screensaver on the Display\n  page. It shows the time and the date, drifting slowly across the screen the\n  same way the SteadyScreen mark does, and it keeps to the same hours.\n- The time follows the display's own clock and time zone, so a display set to\n  the wrong zone will show the wrong time here too — worth a look at the Clock\n  card if it does.\n",
+   "date": "2026-09-06",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-07",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.108",
+   "notes_md": "- Fixes the screen never turning off when the screensaver was set to 0. Power\n  saving on its own, with no screensaver, did nothing at all — both settings\n  read back exactly as you set them, and nothing happened.\n",
+   "date": "2026-09-06",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-07",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.107",
+   "notes_md": "- Power saving: the Screensaver card can now turn the screen off as well. Set\n  \"Turn the screen off after\" and the display goes dark once it has been left\n  alone that long. Touching it brings the screen straight back.\n- The two timers are independent, both counted from the last touch. Set the\n  screen to turn off sooner than the screensaver and the screensaver simply\n  never appears; set it later and the screensaver plays until then. Both keep\n  to the hours you set.\n- A television shows \"no signal\" while the screen is off. That is normal, and\n  it comes back the moment somebody touches the display — but try it on one\n  display before setting it everywhere, because how quickly a screen lights up\n  again is down to the screen.\n- If the screen has been turned off to save power, the admin page says so, so\n  a display saving power cannot be mistaken for one that has stopped working.\n- The Screensaver card now asks which screensaver first and when it should\n  start second.\n",
+   "date": "2026-09-06",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-07",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.106",
+   "notes_md": "- A screensaver, off unless you turn it on. There is a Screensaver card on the\n  Display page: set \"Start after\" and the SteadyScreen mark drifts slowly\n  across the screen once the display has been left alone for that long.\n  Touching the screen brings the page straight back, and that first touch is\n  not passed on to the page — so waking a display cannot press a button on it.\n- You can also say when it is allowed to run. Leave it on \"any time of day\",\n  or set hours — a shop that does not want it during trading sets it to run\n  from closing until opening, and a window that crosses midnight is fine. If\n  the hours end while the screensaver is showing, the display comes back on\n  its own rather than waiting for somebody to touch it.\n- It is deliberately not a blank screen. A dark display looks like a broken\n  one, and a mark moving across the screen also keeps a still page from\n  marking the panel.\n- The screensaver never covers the pages the display uses to tell you\n  something — no network, the saved page, first-time setup — nor the admin\n  page while somebody is on it. If a receipt prints, the screen comes back so\n  you can see which display printed it.\n- If the display is also set to return to its home page when idle, it now does\n  that behind the screensaver, so the page is ready the moment somebody\n  touches it.\n",
+   "date": "2026-09-06",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-07",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.105",
+   "notes_md": "- The Boot splash card is no longer shown on the admin page. Setting your own\n  splash is part of a paid licence and is managed centrally, so there was\n  nothing on that card a display could actually do.\n- Fixes an update started from the admin page not recording that it happened.\n  The display updated correctly, but went on reporting the version it had\n  before, and \"last checked / last updated\" stayed wrong until the next time.\n- The updater now keeps a log of what it did, so an update that goes wrong can\n  be looked at afterwards instead of guessed at.\n- Fixes a display that could go a whole day after an operating-system update\n  without its network watchdog, its print-queue recovery, or the settings that\n  let it find printers on the network. Those repairs used to run only between\n  3am and 5am; they now run whenever the display checks for updates.\n- Fixes the Undo button offering to undo an update back to the version the\n  display is already running.\n- After undoing an update, that version is held back so it is not reinstalled\n  overnight. The page now says so, and offers \"Install anyway\" to take it\n  again — you no longer need a command line to get past it. A display never\n  reports holding the version it is actually running.\n- Only one copy of the ScreenConnect dialog watcher can run at a time.\n- Rollback snapshots. The display now keeps what it was before each of its\n  last five updates — the software, the system files an update changes, and\n  the settings — and any of them can be restored from the admin page. Save\n  current state adds one for right now. They cost almost nothing, because\n  files that did not change between updates are shared rather than copied.\n- The separate settings-only snapshots have been removed from the page. There\n  was no way to tell at a glance which of the two would put the software back,\n  and only one of them ever did.\n- Installing an update now asks first, shows what changed, and says whether it\n  can be undone.\n- Restarting a display asks first, counts down, and reloads the page by itself\n  once the display is back.\n- Clearing a stuck USB printer no longer resets the other printer beside it.\n- A printer that is busy printing is no longer mistaken for one that has been\n  unplugged, which could send a second copy of a receipt to the backup.\n- The ScreenConnect \"not supported\" messages no longer sit on the screen\n  waiting for somebody to click OK.\n",
+   "date": "2026-09-06",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-06",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.104",
+   "notes_md": "- Fixes an update started from the admin page not recording that it happened.\n  The display updated correctly, but went on reporting the version it had\n  before, and \"last checked / last updated\" stayed wrong until the next time.\n- The updater now keeps a log of what it did, so an update that goes wrong can\n  be looked at afterwards instead of guessed at.\n- Fixes a display that could go a whole day after an operating-system update\n  without its network watchdog, its print-queue recovery, or the settings that\n  let it find printers on the network. Those repairs used to run only between\n  3am and 5am; they now run whenever the display checks for updates.\n- Fixes the Undo button offering to undo an update back to the version the\n  display is already running.\n- After undoing an update, that version is held back so it is not reinstalled\n  overnight. The page now says so, and offers \"Install anyway\" to take it\n  again — you no longer need a command line to get past it. A display never\n  reports holding the version it is actually running.\n- Only one copy of the ScreenConnect dialog watcher can run at a time.\n- Rollback snapshots. The display now keeps what it was before each of its\n  last five updates — the software, the system files an update changes, and\n  the settings — and any of them can be restored from the admin page. Save\n  current state adds one for right now. They cost almost nothing, because\n  files that did not change between updates are shared rather than copied.\n- The separate settings-only snapshots have been removed from the page. There\n  was no way to tell at a glance which of the two would put the software back,\n  and only one of them ever did.\n- Installing an update now asks first, shows what changed, and says whether it\n  can be undone.\n- Restarting a display asks first, counts down, and reloads the page by itself\n  once the display is back.\n- Clearing a stuck USB printer no longer resets the other printer beside it.\n- A printer that is busy printing is no longer mistaken for one that has been\n  unplugged, which could send a second copy of a receipt to the backup.\n- The ScreenConnect \"not supported\" messages no longer sit on the screen\n  waiting for somebody to click OK.\n",
+   "date": "2026-09-06",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-06",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.103",
+   "notes_md": "- Fixes a display that could go a whole day after an operating-system update\n  without its network watchdog, its print-queue recovery, or the settings that\n  let it find printers on the network. Those repairs used to run only between\n  3am and 5am; they now run whenever the display checks for updates.\n- Fixes the Undo button offering to undo an update back to the version the\n  display is already running.\n- After undoing an update, that version is held back so it is not reinstalled\n  overnight. The page now says so, and offers \"Install anyway\" to take it\n  again — you no longer need a command line to get past it. A display never\n  reports holding the version it is actually running.\n- Only one copy of the ScreenConnect dialog watcher can run at a time.\n- Rollback snapshots. The display now keeps what it was before each of its\n  last five updates — the software, the system files an update changes, and\n  the settings — and any of them can be restored from the admin page. Save\n  current state adds one for right now. They cost almost nothing, because\n  files that did not change between updates are shared rather than copied.\n- The separate settings-only snapshots have been removed from the page. There\n  was no way to tell at a glance which of the two would put the software back,\n  and only one of them ever did.\n- Installing an update now asks first, shows what changed, and says whether it\n  can be undone.\n- Restarting a display asks first, counts down, and reloads the page by itself\n  once the display is back.\n- Clearing a stuck USB printer no longer resets the other printer beside it.\n- A printer that is busy printing is no longer mistaken for one that has been\n  unplugged, which could send a second copy of a receipt to the backup.\n- The ScreenConnect \"not supported\" messages no longer sit on the screen\n  waiting for somebody to click OK.\n",
+   "date": "2026-09-06",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-06",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.102",
+   "notes_md": "- Fixes a display that could go a whole day after an operating-system update\n  without its network watchdog, its print-queue recovery, or the settings that\n  let it find printers on the network. Those repairs used to run only between\n  3am and 5am; they now run whenever the display checks for updates.\n- Fixes the Undo button offering to undo an update back to the version the\n  display is already running.\n- After undoing an update, that version is held back so it is not reinstalled\n  overnight. The page now says so, and offers \"Install anyway\" to take it\n  again — you no longer need a command line to get past it. A display never\n  reports holding the version it is actually running.\n- Only one copy of the ScreenConnect dialog watcher can run at a time.\n- Rollback snapshots. The display now keeps what it was before each of its\n  last five updates — the software, the system files an update changes, and\n  the settings — and any of them can be restored from the admin page. They\n  cost almost nothing, because files that did not change between updates are\n  shared rather than copied.\n- Installing an update now asks first, shows what changed, and says whether it\n  can be undone.\n- Restarting a display asks first, counts down, and reloads the page by itself\n  once the display is back.\n- Clearing a stuck USB printer no longer resets the other printer beside it.\n- A printer that is busy printing is no longer mistaken for one that has been\n  unplugged, which could send a second copy of a receipt to the backup.\n- The ScreenConnect \"not supported\" messages no longer sit on the screen\n  waiting for somebody to click OK.\n",
+   "date": "2026-09-06",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-06",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.101",
+   "notes_md": "- Fixes a display that could go a whole day after an operating-system update\n  without its network watchdog, its print-queue recovery, or the settings that\n  let it find printers on the network. Those repairs used to run only between\n  3am and 5am; they now run whenever the display checks for updates.\n- Fixes the Undo button offering to undo an update back to the version the\n  display is already running.\n- After undoing an update, that version is held back so it is not reinstalled\n  overnight. The page now says so, and offers \"Install anyway\" to take it\n  again — you no longer need a command line to get past it. A display never\n  reports holding the version it is actually running.\n- Only one copy of the ScreenConnect dialog watcher can run at a time.\n- Undo an update. The admin page gains an \"Undo the update\" button when there\n  is something to undo, and puts the software, the system files an update\n  changed, and the settings back as they were immediately before it.\n- Installing an update now asks first, shows what changed, and says whether it\n  can be undone.\n- Restarting a display asks first, counts down, and reloads the page by itself\n  once the display is back.\n- Clearing a stuck USB printer no longer resets the other printer beside it.\n- A printer that is busy printing is no longer mistaken for one that has been\n  unplugged, which could send a second copy of a receipt to the backup.\n- The ScreenConnect \"not supported\" messages no longer sit on the screen\n  waiting for somebody to click OK.\n",
+   "date": "2026-09-06",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-06",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.100",
+   "notes_md": "- Fixes a display that could go a whole day after an operating-system update\n  without its network watchdog, its print-queue recovery, or the settings that\n  let it find printers on the network. Those repairs used to run only between\n  3am and 5am; they now run whenever the display checks for updates.\n- Fixes the Undo button offering to undo an update back to the version the\n  display is already running.\n- After undoing an update, that version is held back so it is not reinstalled\n  overnight. The page now says so, and offers \"Install anyway\" to take it\n  again — you no longer need a command line to get past it.\n- Only one copy of the ScreenConnect dialog watcher can run at a time.\n- Undo an update. The admin page gains an \"Undo the update\" button when there\n  is something to undo, and puts the software, the system files an update\n  changed, and the settings back as they were immediately before it.\n- Installing an update now asks first, shows what changed, and says whether it\n  can be undone.\n- Restarting a display asks first, counts down, and reloads the page by itself\n  once the display is back.\n- Clearing a stuck USB printer no longer resets the other printer beside it.\n- A printer that is busy printing is no longer mistaken for one that has been\n  unplugged, which could send a second copy of a receipt to the backup.\n- The ScreenConnect \"not supported\" messages no longer sit on the screen\n  waiting for somebody to click OK.\n",
+   "date": "2026-09-06",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-06",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.99",
+   "notes_md": "- Fixes a display that could go a whole day after an operating-system update\n  without its network watchdog, its print-queue recovery, or the settings that\n  let it find printers on the network. Those repairs used to run only between\n  3am and 5am; they now run whenever the display checks for updates.\n- Fixes the Undo button offering to undo an update back to the version the\n  display is already running.\n- Only one copy of the ScreenConnect dialog watcher can run at a time.\n- Undo an update. The admin page gains an \"Undo the update\" button when there\n  is something to undo, and puts the software, the system files an update\n  changed, and the settings back as they were immediately before it.\n- Installing an update now asks first, shows what changed, and says whether it\n  can be undone.\n- Restarting a display asks first, counts down, and reloads the page by itself\n  once the display is back.\n- Clearing a stuck USB printer no longer resets the other printer beside it.\n- A printer that is busy printing is no longer mistaken for one that has been\n  unplugged, which could send a second copy of a receipt to the backup.\n- The ScreenConnect \"not supported\" messages no longer sit on the screen\n  waiting for somebody to click OK.\n",
+   "date": "2026-09-06",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-06",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.98",
+   "notes_md": "- Fixes a display that could go a whole day after an operating-system update\n  without its network watchdog, its print-queue recovery, or the settings that\n  let it find printers on the network. Those repairs used to run only between\n  3am and 5am; they now run whenever the display checks for updates.\n- Only one copy of the ScreenConnect dialog watcher can run at a time.\n- Undo an update. The admin page gains an \"Undo the update\" button when there\n  is something to undo, and puts the software, the system files an update\n  changed, and the settings back as they were immediately before it.\n- Installing an update now asks first, shows what changed, and says whether it\n  can be undone.\n- Restarting a display asks first, counts down, and reloads the page by itself\n  once the display is back.\n- Clearing a stuck USB printer no longer resets the other printer beside it.\n- A printer that is busy printing is no longer mistaken for one that has been\n  unplugged, which could send a second copy of a receipt to the backup.\n- The ScreenConnect \"not supported\" messages no longer sit on the screen\n  waiting for somebody to click OK.\n",
+   "date": "2026-09-06",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-06",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.97",
+   "notes_md": "- Fixes a display that could go a whole day after an operating-system update\n  without its network watchdog, its print-queue recovery, or the settings that\n  let it find printers on the network. Those repairs used to run only between\n  3am and 5am; they now run whenever the display checks for updates.\n- Undo an update. The admin page gains an \"Undo the update\" button when there\n  is something to undo, and puts the software, the system files an update\n  changed, and the settings back as they were immediately before it.\n- Installing an update now asks first, shows what changed, and says whether it\n  can be undone.\n- Restarting a display asks first, counts down, and reloads the page by itself\n  once the display is back.\n- Clearing a stuck USB printer no longer resets the other printer beside it.\n- A printer that is busy printing is no longer mistaken for one that has been\n  unplugged, which could send a second copy of a receipt to the backup.\n- The ScreenConnect \"not supported\" messages no longer sit on the screen\n  waiting for somebody to click OK.\n",
+   "date": "2026-09-05",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-06",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  },
+  {
+   "version": "1.14.96",
+   "notes_md": "- Undo the last update. The admin page gains an \"Undo the update\" button when\n  there is something to undo; it puts the software, the system files an update\n  changes, and the settings back as they were immediately before it.\n- Restarting a display now asks first, counts down, and reloads the page by\n  itself once the display answers.\n- Clearing a wedged USB printer no longer resets the other printer beside it.\n- A printer that is busy printing is no longer mistaken for one that has been\n  unplugged, which could send a receipt to the backup printer as well.\n- The ScreenConnect \"not supported\" dialogs no longer sit on the screen.\n",
+   "date": "2026-09-05",
+   "kernel": null,
+   "requires_os": "1.4.3",
+   "stable_at": "2026-09-06",
+   "channels": [
+    "testing",
+    "stable"
+   ]
+  }
+ ]
+}
