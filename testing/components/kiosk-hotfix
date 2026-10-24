@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""The urgent lane: patch ONE system package between OS releases.
+
+    kiosk-hotfix apply    install or retire each hotfix as the system needs it
+    kiosk-hotfix status   say what is active and why, changing nothing
+
+The owner, 2026-10-24, after a 72 h OS soak was proposed for CVE-2026-111497:
+"a 72 hour soak is not good on an urgent update" ... "an urgent update path is
+needed ot patch only that one specific issue." A full OS release is a new
+slot, a reboot and an attended install on every display. This carries just the
+fixed shared libraries, as signed components, and puts them where the loader
+looks FIRST (/usr/local/lib/<triplet> precedes /usr/lib/<triplet> in
+ld.so.conf), so the next process that starts uses the fix.
+
+Each hotfix in /usr/local/share/steadyscreen/hotfix/hotfixes.json names the
+package it covers and the version that fixes it. It is ACTIVE only while the
+system's own package is older than that. Once an OS update brings the fixed
+(or a newer) package, it RETIRES itself: our copies are removed, so they can
+never shadow a newer system library. Only files whose sha256 is ours are ever
+touched -- anything else in that directory is somebody else's and is left alone.
+
+Exit status: 0 nothing changed or only retired; 10 a library was installed and
+the browser must restart to load it; 1 something went wrong (nothing broken:
+on any failure the copies just installed are taken back out).
+Root only. Python standard library only.
+"""
+import hashlib
+import json
+import os
+import platform
+import subprocess
+import sys
+
+STAGE = "/usr/local/share/steadyscreen/hotfix"
+DESC = os.path.join(STAGE, "hotfixes.json")
+STATE = "/var/lib/kiosk/hotfix-state.json"
+
+
+def sha256(path):
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def installed_version(package):
+    try:
+        p = subprocess.run(["dpkg-query", "-W", "-f=${Version}", package],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def older_than(have, fixed):
+    """dpkg's own comparison. An unreadable installed version counts as
+    older -- a hotfix that might be needed is applied, never skipped."""
+    if not have:
+        return True
+    try:
+        return subprocess.run(["dpkg", "--compare-versions", have, "lt", fixed],
+                              timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return True
+
+
+def elf_ok(path, machine):
+    """An ELF shared object for this machine, read from its own header."""
+    want = {"x86_64": 62, "aarch64": 183}.get(machine)
+    try:
+        with open(path, "rb") as fh:
+            h = fh.read(20)
+    except OSError:
+        return False
+    return (len(h) == 20 and h[:4] == b"\x7fELF" and h[4] == 2
+            and int.from_bytes(h[16:18], "little") == 3            # ET_DYN
+            and int.from_bytes(h[18:20], "little") == want)
+
+
+def load_desc(path=None):
+    try:
+        with open(path or DESC) as fh:
+            d = json.load(fh)
+        if not isinstance(d, dict) or d.get("v") != 1:
+            return []
+        return [f for f in (d.get("hotfixes") or []) if isinstance(f, dict)]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def plan(fix, machine=None, have=None, stage=None):
+    stage = stage or STAGE
+    """('activate'|'retire', why) for one hotfix. Pure apart from reading the
+    staged files' hashes."""
+    machine = machine or platform.machine()
+    if fix.get("arch") and fix["arch"] != machine:
+        return "retire", "not for this machine (%s)" % machine
+    have = installed_version(fix["package"]) if have is None else have
+    if not older_than(have, fix["fixed"]):
+        return "retire", "system %s %s is already fixed (>= %s)" % (fix["package"], have, fix["fixed"])
+    for f in fix["files"]:
+        src = os.path.join(stage, f["name"])
+        if sha256(src) != f["sha256"]:
+            return "retire", "staged %s missing or not the shipped file" % f["name"]
+        if not elf_ok(src, machine):
+            return "retire", "staged %s is not a %s shared library" % (f["name"], machine)
+    return "activate", "system %s %s is older than %s" % (fix["package"], have or "?", fix["fixed"])
+
+
+def _install(src, dest):
+    tmp = dest + ".ss-tmp"
+    with open(src, "rb") as a, open(tmp, "wb") as b:
+        b.write(a.read())
+        b.flush()
+        os.fsync(b.fileno())
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, dest)
+
+
+def activate(fix, stage=None):
+    stage = stage or STAGE
+    """Returns True if anything changed."""
+    libdir = fix["libdir"]
+    os.makedirs(libdir, exist_ok=True)
+    changed = False
+    for f in fix["files"]:
+        dest = os.path.join(libdir, f["name"])
+        if sha256(dest) != f["sha256"]:
+            _install(os.path.join(stage, f["name"]), dest)
+            changed = True
+        link = os.path.join(libdir, f["soname"])
+        if not (os.path.islink(link) and os.readlink(link) == f["name"]):
+            if os.path.lexists(link):
+                os.remove(link)
+            os.symlink(f["name"], link)
+            changed = True
+    return changed
+
+
+def retire(fix):
+    """Remove only OUR files (matched by hash) and the soname links that point
+    at them. Returns True if anything changed."""
+    libdir = fix["libdir"]
+    changed = False
+    for f in fix["files"]:
+        dest = os.path.join(libdir, f["name"])
+        link = os.path.join(libdir, f["soname"])
+        ours = sha256(dest) == f["sha256"]
+        if os.path.islink(link) and os.readlink(link) == f["name"] and (ours or not os.path.exists(dest)):
+            os.remove(link)
+            changed = True
+        if ours:
+            os.remove(dest)
+            changed = True
+    return changed
+
+
+def ldconfig():
+    return subprocess.run(["ldconfig"], timeout=120).returncode == 0
+
+
+def loads(fix):
+    """Can a fresh process load every library from where we put it?"""
+    for f in fix["files"]:
+        p = subprocess.run([sys.executable, "-I", "-c",
+                            "import ctypes,sys; ctypes.CDLL(sys.argv[1])",
+                            os.path.join(fix["libdir"], f["soname"])], timeout=30)
+        if p.returncode != 0:
+            return False
+    return True
+
+
+def save_state(state):
+    try:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        with open(STATE + ".tmp", "w") as fh:
+            json.dump(state, fh)
+        os.replace(STATE + ".tmp", STATE)
+    except OSError:
+        pass
+
+
+def cmd_apply():
+    restart, failed, state = False, False, {}
+    for fix in load_desc():
+        action, why = plan(fix)
+        try:
+            if action == "activate":
+                if activate(fix):
+                    if not ldconfig() or not loads(fix):
+                        retire(fix)
+                        ldconfig()
+                        print("%s: could NOT be activated (ldconfig or a test load failed); "
+                              "taken back out, the system copy stays in use" % fix["id"])
+                        failed = True
+                        state[fix["id"]] = {"active": False, "why": "activation failed"}
+                        continue
+                    print("%s: activated -- %s" % (fix["id"], why))
+                    restart = True
+                state[fix["id"]] = {"active": True, "why": why}
+            else:
+                if retire(fix):
+                    ldconfig()
+                    print("%s: retired -- %s" % (fix["id"], why))
+                state[fix["id"]] = {"active": False, "why": why}
+        except (OSError, subprocess.SubprocessError) as e:
+            print("%s: %s" % (fix["id"], e))
+            failed = True
+    save_state(state)
+    return 1 if failed else (10 if restart else 0)
+
+
+def cmd_status():
+    out = []
+    for fix in load_desc():
+        action, why = plan(fix)
+        live = all(sha256(os.path.join(fix["libdir"], f["name"])) == f["sha256"] for f in fix["files"])
+        out.append({"id": fix["id"], "package": fix["package"], "fixed": fix["fixed"],
+                    "wanted": action == "activate", "installed": live, "why": why})
+    print(json.dumps(out))
+    return 0
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "apply":
+        if os.geteuid() != 0:
+            print("kiosk-hotfix apply must run as root", file=sys.stderr)
+            return 1
+        return cmd_apply()
+    print("usage: kiosk-hotfix apply|status", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,640 @@
+#!/usr/bin/env python3
+"""The network watchdog: notice that this display cannot reach anything, and
+escalate until it can.
+
+    kiosk-netwatch check     one probe, then whatever that calls for (the timer)
+    kiosk-netwatch probe     probe only; changes nothing
+    kiosk-netwatch status    what it knows, as JSON
+    kiosk-netwatch install   write and enable its own units
+    kiosk-netwatch reset     forget the escalation state
+
+Why this exists, and what it is NOT.
+
+NetworkManager gives a connection four autoconnect attempts and then stops.
+`kiosk-update` repairs that on every pass, so the fleet no longer gives up --
+but retries only cover NM giving up. They do not cover a wedged driver, a
+supplicant sitting on a BSSID that is no longer there, or a lease that never
+renews. For those, something has to notice that the machine cannot actually
+reach anything and do progressively less gentle things about it.
+
+WHAT COUNTS AS THE NETWORK BEING BROKEN, and this is the whole design:
+
+    the default gateway answers          the network is fine
+    the gateway does not answer          the network is broken -- escalate
+    the gateway is fine, the site is not SOMEBODY ELSE'S outage -- do nothing
+
+The third line is the one that keeps this safe. A display whose page is down
+must not restart its network, and must certainly not reboot: the fault is not
+here, nothing this script can do will fix it, and a shop watching a menu board
+reboot every quarter of an hour because a hosting provider is having a bad
+afternoon is a worse outcome than the outage. So the site is measured and
+reported, and it never drives an escalation.
+
+THE LADDER, one rung per consecutive failed minute:
+
+    2   re-apply the connection to the device -- the cheapest thing that
+        renews a lease
+    4   nmcli connection up -- a full re-activation
+    6   restart NetworkManager
+    10  restart NetworkManager again, because once is not evidence
+    15  reboot
+
+Reboot is last, is never on a schedule, and carries two guards worth stating:
+
+  * It only ever happens if the network worked at least once SINCE THIS BOOT.
+    A machine that came up with no network has already tried the only thing a
+    reboot would try, and rebooting it again just puts it in a loop -- which
+    is exactly the state a display on a genuinely dead network would sit in
+    for ever. The failure this catches is "it was working and now it is not",
+    and that condition says so precisely.
+  * Not while an update is running. Rebooting through a software or OS update
+    is how a machine that had one fault ends up with a worse one.
+
+And the NetworkManager restart defers while the browser is mid-load, because
+taking the network away from a page that is loading is its own outage. It
+defers twice and then goes ahead: a client that is permanently "loading"
+must not be able to veto the repair for ever.
+"""
+
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+
+CONFIG = "/etc/kiosk/config.json"
+STATE = "/var/lib/kiosk/netwatch.json"
+UNIT_DIR = "/etc/systemd/system"
+LOG_KEEP = 20                    # events kept for the admin page
+
+# The ladder. consecutive failures -> what to do about it.
+LADDER = [
+    (2,  "renew"),
+    (4,  "up"),
+    (6,  "nm-restart"),
+    (10, "nm-restart"),
+    (15, "reboot"),
+]
+MIN_REBOOT_GAP = 3600            # seconds between watchdog reboots, at least
+MAX_LOAD_DEFERS = 2              # how long a loading page may hold off a restart
+MAX_PROFILES_TRIED = 3           # saved networks to try when nothing is active
+
+SERVICE_UNIT = """\
+[Unit]
+Description=SteadyScreen network watchdog
+Documentation=man:kiosk-netwatch
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kiosk-netwatch check
+# A probe is quick. Bringing up saved profiles when nothing is active is not:
+# a network that has genuinely gone takes its full timeout to fail, three
+# times over. Long enough to finish that, short enough that a wedged run is
+# still cleared before it can matter.
+TimeoutStartSec=120
+"""
+
+TIMER_UNIT = """\
+[Unit]
+Description=Run the SteadyScreen network watchdog every minute
+
+[Timer]
+# Not at boot: the first ninety seconds are wifi association, DHCP and the
+# browser starting, and every one of those looks like a broken network.
+OnBootSec=90
+OnUnitActiveSec=60
+AccuracySec=5s
+Unit=kiosk-netwatch.service
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def say(msg):
+    """To stderr, which is the journal. The state file is the durable record."""
+    print("netwatch: %s" % msg, file=sys.stderr)
+
+
+def run(*args, timeout=20):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True,
+                           timeout=timeout)
+        return p.returncode == 0, (p.stdout or "") + (p.stderr or "")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+
+
+def cfg():
+    try:
+        with open(CONFIG) as fh:
+            return json.load(fh)
+    except Exception:                                         # noqa: BLE001
+        return {}
+
+
+def boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def load_state():
+    try:
+        with open(STATE) as fh:
+            st = json.load(fh)
+        if not isinstance(st, dict):
+            raise ValueError("not an object")
+    except Exception:                                         # noqa: BLE001
+        st = {}
+    st.setdefault("fails", 0)
+    st.setdefault("boot_id", "")
+    st.setdefault("ever_ok", False)
+    st.setdefault("last_ok", 0)
+    st.setdefault("last_reboot", 0)
+    st.setdefault("defers", 0)
+    st.setdefault("actions", 0)
+    st.setdefault("log", [])
+    # A new boot is a new argument. Carry last_reboot across, because the
+    # whole point of it is to bound reboots that themselves end the boot.
+    if st["boot_id"] != boot_id():
+        st["boot_id"] = boot_id()
+        st["fails"] = 0
+        st["ever_ok"] = False
+        st["defers"] = 0
+    return st
+
+
+def save_state(st):
+    st["log"] = st["log"][-LOG_KEEP:]
+    d = os.path.dirname(STATE)
+    try:
+        os.makedirs(d, exist_ok=True)
+        tmp = STATE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(st, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, STATE)
+    except OSError as exc:
+        say("could not write %s: %s" % (STATE, exc))
+
+
+def note(st, msg):
+    st["log"].append({"at": int(time.time()), "what": msg})
+    say(msg)
+
+
+# --------------------------------------------------------------------------
+# the probe
+# --------------------------------------------------------------------------
+
+def default_gateway():
+    """(gateway, device) from the default route, or (None, None)."""
+    ok, out = run("ip", "-4", "route", "show", "default", timeout=5)
+    if not ok:
+        return None, None
+    m = re.search(r"default via (\S+) dev (\S+)", out)
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+def connected_devices():
+    """Devices NetworkManager considers connected, as (name, type)."""
+    ok, out = run("nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device", "status",
+                  timeout=10)
+    if not ok:
+        return []
+    found = []
+    for line in out.splitlines():
+        bits = line.split(":")
+        if len(bits) >= 3 and bits[2] == "connected" and bits[1] != "loopback":
+            found.append((bits[0], bits[1]))
+    return found
+
+
+def tcp_touch(host, port, timeout=2):
+    """Did anything answer at IP level? A refusal is an answer.
+
+    A closed port that sends a RST proves the host is there just as well as an
+    open one -- better, in fact, because it needs no service to be running.
+    """
+    try:
+        socket.create_connection((host, port), timeout).close()
+        return True
+    except (ConnectionRefusedError, ConnectionResetError):
+        return True
+    except OSError:
+        return False
+
+
+def gateway_alive(gw, dev=None):
+    """Can this machine talk to its own default gateway?
+
+    NOT just ping, and finding that out cost an afternoon. On a real client
+    (.63, a Flying Fish menu board, 2026-09-02) `ping` has neither setuid nor
+    cap_net_raw and /proc/sys/net/ipv4/ping_group_range is "1 0", so an
+    unprivileged ping cannot even open a socket. The watchdog itself runs as
+    root and would have been fine -- but a probe that answers "the gateway is
+    silent" when what happened is "I was not allowed to ask" is a probe that
+    lies in exactly one direction: towards rebooting a healthy display.
+    Plenty of gateways drop ICMP outright, too, and that is not a fault
+    either.
+
+    So three ways of asking, cheapest first, and any one of them is proof:
+
+        the kernel's own neighbour table says REACHABLE -- which means real
+          traffic has been exchanged, and is the strongest evidence available
+        ICMP, when it is permitted and answered
+        a TCP touch on a port a router usually has, where even a refusal is
+          the host announcing itself
+
+    Returns (alive, how) so the state file records which one answered; a
+    display whose gateway only ever answers by TCP is worth being able to see.
+    """
+    ok, out = run("ip", "neigh", "show", gw, timeout=5)
+    if ok and "REACHABLE" in out:
+        return True, "neighbour table"
+
+    args = ["ping", "-n", "-c", "2", "-W", "2"]
+    if dev:
+        args += ["-I", dev]
+    ok, out = run(*args, gw, timeout=12)
+    if ok:
+        return True, "ping"
+    permitted = "not permitted" not in out and "cap_net_raw" not in out
+
+    for port in (53, 80, 443):
+        if tcp_touch(gw, port):
+            return True, "tcp/%d" % port
+
+    return False, ("no answer to ping or tcp" if permitted
+                   else "no answer to tcp (ping is not permitted here)")
+
+
+def target():
+    """(host, port) of the configured page, or (None, None)."""
+    url = (cfg().get("url") or "").strip()
+    if not url or url.startswith("about:"):
+        return None, None
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(url if "//" in url else "http://" + url)
+        if not u.hostname:
+            return None, None
+        return u.hostname, u.port or (443 if u.scheme == "https" else 80)
+    except Exception:                                         # noqa: BLE001
+        return None, None
+
+
+def reaches(host, port, timeout=4):
+    try:
+        with socket.create_connection((host, port), timeout):
+            return True
+    except OSError:
+        return False
+
+
+def probe():
+    """Is THIS MACHINE'S network working? The site is measured, never judged."""
+    out = {"at": int(time.time()), "ok": False, "why": "",
+           "gateway": None, "device": None, "site": None}
+
+    devs = connected_devices()
+    out["devices"] = [d for d, _ in devs]
+    gw, dev = default_gateway()
+    out["gateway"], out["device"] = gw, dev
+
+    host, port = target()
+    if host:
+        out["site"] = reaches(host, port)
+        out["site_host"] = "%s:%s" % (host, port)
+
+    if not devs:
+        out["why"] = "no device is connected"
+        out["how"] = "nothing to ask"
+        return out
+    if not gw:
+        out["why"] = "no default route"
+        out["how"] = "nothing to ask"
+        return out
+    alive, how = gateway_alive(gw, dev)
+    out["how"] = how
+    if alive:
+        out["ok"] = True
+        return out
+    # Some gateways drop ICMP. Reaching the configured site through that
+    # gateway proves the route works just as well, so it is the second
+    # question rather than the first -- and it is the only place the site
+    # is allowed to influence the verdict, in the direction of doing less.
+    if out["site"]:
+        out["ok"] = True
+        out["why"] = "the gateway is silent, but the site answers"
+        return out
+    out["why"] = "gateway %s: %s" % (gw, how)
+    return out
+
+
+# --------------------------------------------------------------------------
+# the ladder
+# --------------------------------------------------------------------------
+
+def admin_port():
+    c = cfg()
+    for p in (c.get("admin_port"), 80, 8080):
+        if not p:
+            continue
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/api/status" % int(p), timeout=2):
+                return int(p)
+        except Exception:                                     # noqa: BLE001
+            continue
+    return None
+
+
+def page_is_loading():
+    """True only if we actually know it is. Unknown must not block a repair."""
+    p = admin_port()
+    if not p:
+        return False
+    try:
+        with urllib.request.urlopen(
+                "http://127.0.0.1:%d/api/status" % p, timeout=3) as r:
+            return bool(json.load(r).get("loading"))
+    except Exception:                                         # noqa: BLE001
+        return False
+
+
+def update_running():
+    for unit in ("kiosk-update.service", "kiosk-osupdate.service"):
+        ok, out = run("systemctl", "is-active", unit, timeout=5)
+        if ok and out.strip() == "active":
+            return unit
+    ok, out = run("pgrep", "-f", "[k]iosk-osupdate", timeout=5)
+    if ok and out.strip():
+        return "kiosk-osupdate"
+    return ""
+
+
+def profiles(active_only=False):
+    """Saved connection profiles, WITHOUT the loopback one.
+
+    Excluding loopback is not tidiness. `nmcli connection show --active` lists
+    NetworkManager's own `lo` profile, and on a machine whose wifi has gone it
+    is the ONLY thing left in that list -- so a caller that asks "is anything
+    active" gets yes, and a caller that brings the active ones up brings up
+    loopback and stops. Seen on .63 on 2026-09-02, rebooted with the access
+    point switched off: the log reads `connection up lo: ok` and the wifi was
+    never touched. The watchdog did its whole job on the one interface that
+    could not possibly be the problem.
+    """
+    args = ["nmcli", "-t", "-f", "UUID,TYPE,NAME", "connection", "show"]
+    if active_only:
+        args.append("--active")
+    ok, out = run(*args, timeout=10)
+    if not ok:
+        return []
+    rows = []
+    for line in out.splitlines():
+        bits = line.split(":", 2)
+        if len(bits) >= 3 and bits[0] and bits[1] != "loopback":
+            rows.append((bits[0], bits[2]))
+    return rows
+
+
+def act_renew(st):
+    devs = connected_devices()
+    if not devs:
+        # Nothing to re-apply. Bring up whatever is saved instead -- one rung
+        # early, because sitting still is not an option worth defending.
+        return act_up(st)
+    done = False
+    for dev, _ in devs:
+        ok, out = run("nmcli", "device", "reapply", dev, timeout=30)
+        note(st, "reapply %s: %s" % (dev, "ok" if ok else out.strip()[:120]))
+        done = done or ok
+    return done
+
+
+def act_up(st):
+    """Re-activate. What that means depends on whether anything is up at all.
+
+    With a real profile active, re-activating it is the whole action. With
+    NOTHING active -- which is where the access-point-came-back failure
+    actually lands, because NM has dropped the connection entirely -- there is
+    nothing to re-activate, and the useful thing is to make sure networking is
+    not switched off and then ask for the saved profiles by name.
+    """
+    rows = profiles(active_only=True)
+    if rows:
+        done = False
+        for uuid, name in rows:
+            ok, out = run("nmcli", "connection", "up", uuid, timeout=30)
+            note(st, "connection up %s: %s"
+                     % (name, "ok" if ok else out.strip()[:120]))
+            done = done or ok
+        return done
+
+    ok, out = run("nmcli", "networking", "on", timeout=30)
+    if not ok:
+        note(st, "networking on: %s" % out.strip()[:120])
+
+    # Bounded. A profile whose access point is genuinely gone takes its full
+    # timeout to fail, and a machine with a long list of saved networks would
+    # otherwise spend longer failing than the interval between checks.
+    saved = profiles()[:MAX_PROFILES_TRIED]
+    if not saved:
+        note(st, "nothing active and no saved profile to bring up")
+        return False
+    done = False
+    for uuid, name in saved:
+        ok, out = run("nmcli", "connection", "up", uuid, timeout=25)
+        note(st, "connection up %s: %s"
+                 % (name, "ok" if ok else out.strip()[:120]))
+        done = done or ok
+        if ok:
+            break
+    return done
+
+
+def act_nm_restart(st):
+    if page_is_loading() and st["defers"] < MAX_LOAD_DEFERS:
+        st["defers"] += 1
+        note(st, "a page is loading; holding off the NetworkManager restart "
+                 "(%d of %d)" % (st["defers"], MAX_LOAD_DEFERS))
+        return None                       # neither done nor failed: try again
+    st["defers"] = 0
+    ok, out = run("systemctl", "restart", "NetworkManager", timeout=60)
+    note(st, "restarted NetworkManager: %s"
+             % ("ok" if ok else out.strip()[:120]))
+    return ok
+
+
+def act_reboot(st):
+    if not cfg().get("netwatch_reboot", True):
+        note(st, "would reboot, but netwatch_reboot is off")
+        return False
+    if not st["ever_ok"]:
+        # The honest rule, and the one that stops a reboot loop dead: this
+        # machine has not had a working network since it booted, so a reboot
+        # is a repeat of the thing that already did not work.
+        note(st, "would reboot, but the network has not worked once since "
+                 "this boot -- rebooting would only repeat it")
+        return False
+    since = time.time() - float(st.get("last_reboot") or 0)
+    if since < MIN_REBOOT_GAP:
+        note(st, "would reboot, but the last watchdog reboot was %d minutes "
+                 "ago" % (since / 60))
+        return False
+    busy = update_running()
+    if busy:
+        note(st, "would reboot, but %s is running" % busy)
+        return False
+    st["last_reboot"] = int(time.time())
+    note(st, "rebooting: no network for %d checks and nothing cheaper worked"
+             % st["fails"])
+    save_state(st)
+    run("systemctl", "reboot", timeout=30)
+    return True
+
+
+ACTIONS = {"renew": act_renew, "up": act_up,
+           "nm-restart": act_nm_restart, "reboot": act_reboot}
+
+
+def check():
+    st = load_state()
+    p = probe()
+    st["last_probe"] = p
+
+    if p["ok"]:
+        if st["fails"]:
+            note(st, "network is back after %d failed checks" % st["fails"])
+        st["fails"] = 0
+        st["defers"] = 0
+        st["ever_ok"] = True
+        st["last_ok"] = p["at"]
+        save_state(st)
+        return 0
+
+    st["fails"] += 1
+    note(st, "check %d failed: %s" % (st["fails"], p["why"]))
+
+    if not cfg().get("netwatch", True):
+        save_state(st)
+        return 1
+
+    for at, what in LADDER:
+        if st["fails"] == at:
+            st["actions"] += 1
+            result = ACTIONS[what](st)
+            if result is None:
+                # Deferred. Step back one so the same rung is tried again on
+                # the next tick rather than being skipped for good.
+                st["fails"] -= 1
+            break
+
+    save_state(st)
+    return 1
+
+
+# --------------------------------------------------------------------------
+# units
+# --------------------------------------------------------------------------
+
+def install_units():
+    """Write the units and enable the timer. Idempotent, and silent when it
+    has nothing to do.
+
+    This is called from kiosk-update's repair block on every pass, not just
+    when it installs something -- because /etc/systemd/system is on the root
+    slot, not on /data, so an OS update takes these files away and the
+    watchdog would simply stop existing. Same shape as the printer mask,
+    which was lost exactly that way.
+    """
+    changed = False
+    for name, body in (("kiosk-netwatch.service", SERVICE_UNIT),
+                       ("kiosk-netwatch.timer", TIMER_UNIT)):
+        path = os.path.join(UNIT_DIR, name)
+        try:
+            with open(path) as fh:
+                if fh.read() == body:
+                    continue
+        except OSError:
+            pass
+        os.makedirs(UNIT_DIR, exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(body)
+        os.chmod(path, 0o644)
+        print("wrote %s" % path)
+        changed = True
+
+    ok, out = run("systemctl", "is-enabled", "kiosk-netwatch.timer", timeout=10)
+    enabled = ok and out.strip() == "enabled"
+    if changed:
+        # Fails harmlessly inside the build chroot, where there is no running
+        # systemd to reload and nothing to tell.
+        run("systemctl", "daemon-reload", timeout=30)
+    if changed or not enabled:
+        ok, out = run("systemctl", "enable", "--now", "kiosk-netwatch.timer",
+                      timeout=30)
+        if ok:
+            print("network watchdog enabled")
+        else:
+            # In a chroot `enable` works (it is a symlink) and `--now` does
+            # not. Say what happened rather than reporting success.
+            print("enable: %s" % out.strip()[:200], file=sys.stderr)
+            run("systemctl", "enable", "kiosk-netwatch.timer", timeout=30)
+    return 0
+
+
+def main():
+    what = sys.argv[1] if len(sys.argv) > 1 else "check"
+    if what in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    if what == "probe":
+        print(json.dumps(probe(), indent=2, sort_keys=True))
+        return 0
+    if what == "status":
+        st = load_state()
+        st["enabled"] = bool(cfg().get("netwatch", True))
+        st["reboot_allowed"] = bool(cfg().get("netwatch_reboot", True))
+        ok, out = run("systemctl", "is-active", "kiosk-netwatch.timer",
+                      timeout=5)
+        st["timer"] = out.strip() or "unknown"
+        print(json.dumps(st, indent=2, sort_keys=True))
+        return 0
+    if os.geteuid() != 0:
+        print("must run as root", file=sys.stderr)
+        return 1
+    if what == "install":
+        return install_units()
+    if what == "reset":
+        st = load_state()
+        st["fails"] = 0
+        st["defers"] = 0
+        note(st, "escalation state cleared by hand")
+        save_state(st)
+        return 0
+    if what == "check":
+        if not shutil.which("nmcli"):
+            say("no nmcli on this machine; nothing to watch")
+            return 0
+        return check()
+    print("usage: kiosk-netwatch check|probe|status|install|reset",
+          file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

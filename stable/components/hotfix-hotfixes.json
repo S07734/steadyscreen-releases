@@ -1,0 +1,31 @@
+{
+ "v": 1,
+ "hotfixes": [
+  {
+   "id": "CVE-2026-111497",
+   "what": "Brotli decoder out-of-bounds write (DSA-6582-1)",
+   "package": "libbrotli1",
+   "fixed": "1.1.0-2+deb13u1",
+   "arch": "x86_64",
+   "libdir": "/usr/local/lib/x86_64-linux-gnu",
+   "source": "security.debian.org pool/updates/main/b/brotli/libbrotli1_1.1.0-2+deb13u1_amd64.deb sha256 db46824c60fee46aff3cc0be3e5f736bc606cae669b1fb17516a41e8073251a9",
+   "files": [
+    {
+     "name": "libbrotlicommon.so.1.1.0",
+     "soname": "libbrotlicommon.so.1",
+     "sha256": "0697dd09666e2a080974470950075ee959f2391ecb173ceee50423f969032d79"
+    },
+    {
+     "name": "libbrotlidec.so.1.1.0",
+     "soname": "libbrotlidec.so.1",
+     "sha256": "ff4baf3141862726c25ab08cdd94bced37dcae0c6827943d3e40fc1079969814"
+    },
+    {
+     "name": "libbrotlienc.so.1.1.0",
+     "soname": "libbrotlienc.so.1",
+     "sha256": "2b9ead837afd8dd8747ef9cf7472293c23907edd69597f2673c67fa9a507f1d6"
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,9 @@
+{
+  "version": "1.5",
+  "software": "1.15.34",
+  "arch": "x86_64",
+  "sha256": "d4c94fe8739fb973dcfc1aa0ef3b0369da3709992b6b280a549dada6e628cb58",
+  "size": 768983040,
+  "url": "https://github.com/S07734/steadyscreen-releases/releases/download/os-1.5/steadyscreen-rootfs-1.5.squashfs",
+  "released": "2026-10-24T10:50:13-05:00"
+}

@@ -1,0 +1,57 @@
+<!doctype html>
+<meta charset=utf-8>
+<title>SteadyScreen video check</title>
+<!-- The video check (owner, 2026-09-27: "video check go ahead and build").
+     kiosk.py loads this in a second WebView laid over the screen, with the
+     SAME WebKit settings as the page view, and reads __vcRead() while a test
+     clip plays. The clip is stretched to fill the window (object-fit: fill)
+     so the screenshot kiosk.py takes can sample the middle of the screen
+     whatever the rotation. The caption sits at the bottom, outside the part
+     that is sampled. -->
+<style>
+html,body{margin:0;height:100%;background:#12141a;overflow:hidden;cursor:none}
+video{position:absolute;left:0;top:0;width:100%;height:100%;object-fit:fill;background:#000}
+#cap{position:absolute;left:0;right:0;bottom:3%;text-align:center;color:#fff;
+  font:600 3.2vh system-ui,sans-serif;text-shadow:0 0 .4em #000}
+</style>
+<video id=v muted playsinline preload=auto></video>
+<div id=cap>Checking video playback &middot; about 15 seconds</div>
+<script>
+var m = /[?&]c=(720p|1080p)/.exec(location.search), clip = m ? m[1] : '720p';
+var v = document.getElementById('v');
+window.__vc = {clip: clip, state: 'loading'};
+// Measured from ONE SECOND AFTER playback starts, with the frame counters taken
+// from that point: the first second is the decoder and compositor starting up,
+// and it made a Celeron N4000 read 24 fps at 720p one day and pass the next
+// (check v3, 2026-09-28).
+function q() { return v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : {}; }
+v.addEventListener('playing', function () {
+  if (__vc.state === 'loading') {
+    __vc.state = 'warming';
+    setTimeout(function () {
+      if (__vc.state !== 'warming') return;
+      var b = q();
+      __vc.f0 = b.totalVideoFrames || 0; __vc.d0 = b.droppedVideoFrames || 0;
+      __vc.state = 'playing'; __vc.t0 = performance.now(); __vc.ct0 = v.currentTime;
+    }, 1000);
+  }
+});
+v.addEventListener('error', function () {
+  __vc.state = 'error'; __vc.error = 'media error ' + ((v.error && v.error.code) || 0);
+});
+v.muted = true;
+v.src = 'videocheck-' + clip + '.mp4';
+var p = v.play();
+if (p && p.catch) p.catch(function (e) { __vc.state = 'error'; __vc.error = String(e).slice(0, 80); });
+window.__vcRead = function () {
+  var n = q(), on = __vc.state === 'playing';
+  return JSON.stringify({
+    clip: clip, state: __vc.state, error: __vc.error || '',
+    elapsed: __vc.t0 ? (performance.now() - __vc.t0) / 1000 : 0,
+    played: __vc.t0 ? v.currentTime - __vc.ct0 : 0,
+    frames: on ? Math.max(0, (n.totalVideoFrames || 0) - __vc.f0) : 0,
+    dropped: on ? Math.max(0, (n.droppedVideoFrames || 0) - __vc.d0) : 0,
+    w: v.videoWidth || 0, h: v.videoHeight || 0
+  });
+};
+</script>
